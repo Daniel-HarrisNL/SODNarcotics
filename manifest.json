@@ -1,0 +1,10 @@
+{
+  "name": "Narcotics",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/benjahirsh/Narcotics",
+  "description": "A new drug hits the streets. Trace the arrests, the dealers and the supply back to a hidden lab and bust the cook.",
+  "dependencies": [
+    "BepInEx-BepInExPack_IL2CPP-6.0.755",
+    "TeamSpyraxi-BepInExConfigManager-1.3.1"
+  ]
+}

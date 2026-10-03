@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>Narcotics</AssemblyName>
+    <Product>Narcotics</Product>
+    <Version>0.1.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RestoreAdditionalProjectSources></RestoreAdditionalProjectSources>
+    <!-- Game install root; adjust if your Steam library differs -->
+    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Shadows of Doubt</GameDir>
+    <PluginsDir>$(GameDir)\BepInEx\plugins\Narcotics</PluginsDir>
+    <!-- These assemblies are provided by the game/BepInEx at runtime; never copy them out -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- BepInEx / IL2CPP interop runtime (curated) -->
+  <ItemGroup>
+    <Reference Include="$(GameDir)\BepInEx\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\core\BepInEx.Core.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\core\0Harmony.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\core\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="$(GameDir)\BepInEx\core\Il2CppInterop.Common.dll" Private="false" />
+  </ItemGroup>
+
+  <!-- All game interop assemblies (Assembly-CSharp, Il2Cpp* , UnityEngine*, etc.) -->
+  <ItemGroup>
+    <Reference Include="$(GameDir)\BepInEx\interop\*.dll" Private="false" />
+  </ItemGroup>
+
+  <!-- Deploy the built plugin straight into the game's plugins folder -->
+  <Target Name="DeployToGame" AfterTargets="Build">
+    <MakeDir Directories="$(PluginsDir)" />
+    <!-- ContinueOnError: if the game is running it locks the DLL; don't fail the build.
+         Just restart the game to load the new build. -->
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll"
+          DestinationFolder="$(PluginsDir)"
+          SkipUnchangedFiles="false"
+          ContinueOnError="true">
+      <Output TaskParameter="CopiedFiles" ItemName="_Deployed" />
+    </Copy>
+    <Message Condition="'@(_Deployed)' != ''" Importance="high" Text="Deployed $(AssemblyName).dll -> $(PluginsDir)" />
+    <Warning Condition="'@(_Deployed)' == ''" Text="Could not deploy (game running?). Restart the game to load the new build, or re-run build once closed." />
+  </Target>
+
+</Project>
