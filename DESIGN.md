@@ -27,7 +27,7 @@ A supporting feature: a new dialog option to **ask an NPC about an item** they a
 - **Resolution = bust the lab.** ONE long-running investigation, not a payable side case per arrest. Individual arrests are leads. Goal and reward is tracing the trail to the lab and taking down the cook.
 - **Work-absence clue = subtle.** Coworkers reveal the cook stopped coming to work ONLY if the player specifically asks, phrased vaguely. A lead to dig for, not a giveaway.
 - **Scale = one operation at a time.** A single lab / cook / drug active city-wide; the next only starts after the current ends. Keeps arrests clustered for the geographic hone-in.
-- **Name = Narcotics.** Package `Narcotics`; in-game name `Narcotics`; GUID `com.benhirsh.narcotics`; folder `workspace\Narcotics`.
+- **Name = Narcotics.** Package `Narcotics`; in-game name `Narcotics`; GUID `com.opi.narcotics`; folder `workspace\Narcotics`.
 
 ## Architecture (from recon)
 

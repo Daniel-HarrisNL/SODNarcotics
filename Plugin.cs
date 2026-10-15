@@ -18,7 +18,7 @@ namespace Narcotics
     [BepInPlugin(Guid, "Narcotics", "0.1.0")]
     public class NarcoticsPlugin : BasePlugin
     {
-        public const string Guid = "com.benhirsh.narcotics";
+        public const string Guid = "com.opi.narcotics";
         internal static new ManualLogSource Log;
         private Harmony _harmony;
 
