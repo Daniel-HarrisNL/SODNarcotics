@@ -148,13 +148,15 @@ namespace Narcotics
         // varies the photo while our GetSummary/GenerateName patches (base-agnostic, keyed on the dose's preset) still
         // drive the caption + title. Matched as a squashed substring so "Dorma-Dix"/"Birth Control Pills" etc. hit
         // regardless of spacing/case/hyphens.
-        // RESTRICTED to BetaBlockers only: it is the ONLY base whose clone NewGameLocation.PlaceObject can actually spawn
-        // into the lab stash. ALL the other candidates (paxadol/painkillers, sleeping pills, poison, insulin injector,
-        // birth control pills, syringe) make PlaceObject return null, so the cook's dose never reaches the stash and the
-        // supply chain stalls for those bases (log: "[dose] Place: PlaceObject returned NULL ..."). To re-enable item
-        // variety, the cook->distributor handoff must become data-side (distributor collects from the cook's inventory
-        // instead of a placed world item); until then only BetaBlockers is safe. (The per-case drug NAME still varies.)
-        private static readonly string[] DrugBaseTerms = { "betablocker" };
+        // Variety pool = the drug items the game's NewGameLocation.PlaceObject can actually spawn into the lab stash.
+        // Verified in-game: BetaBlockers, PoisonBottle, BirthControlPills, Syringe PLACE; SleepingPills, Painkillers,
+        // InsulinInjector return NULL. PlaceObject is the world-gen CLUTTER placer, so it only seats an item the game
+        // also auto-spawns as free-standing world clutter: all four that work have autoPlacement != never (onlyInHomes /
+        // always - you find them lying around), whereas the three that fail are vending/retail-only medical items whose
+        // prefab has no valid world-resting footprint. Not a settable preset field. We include only the 4 that place -
+        // every case runs the normal cook->lab-stash->distributor chain, no workaround. (Syringe is a weapon base, left
+        // attackable per the user.)
+        private static readonly string[] DrugBaseTerms = { "betablocker", "poison", "birthcontrol", "syringe" };
 
         // Build the per-session pool of drug-item bases: every preset whose squashed name matches a term AND spawns
         // evidence (so it examines as a card). Logged so the matched set is visible after a run. Empty pool -> PickBase

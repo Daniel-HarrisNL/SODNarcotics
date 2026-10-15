@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.0
+Added 3 more drug types
+
 ## 0.1.4
 Limited drugs to one object type to fix supply-chain stall
 
