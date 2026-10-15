@@ -87,13 +87,20 @@ namespace Narcotics
             try
             {
                 var preset = DrugItem.Current;
-                if (preset == null || loc == null) return null;
+                if (preset == null || loc == null) { Log($"Place: null preset or loc (preset={(preset==null?"NULL":"ok")}, loc={(loc==null?"NULL":"ok")})"); return null; }
+                string pn = SafePresetName(preset);
                 FurnitureLocation furn;
-                Interactable it = loc.PlaceObject(preset, owner, null, null, out furn,
-                    passVariable: false, forceSecuritySettings: true, forcedSecurity: 0,
-                    forcedOwnership: InteractablePreset.OwnedPlacementRule.both, forcedPriority: 5,
-                    placeClosestTo: near, ignoreLimits: true);
-                if (it != null && owner != null) { try { it.AddNewDynamicFingerprint(owner, Interactable.PrintLife.timed); } catch { } }
+                Interactable it = null;
+                try
+                {
+                    it = loc.PlaceObject(preset, owner, null, null, out furn,
+                        passVariable: false, forceSecuritySettings: true, forcedSecurity: 0,
+                        forcedOwnership: InteractablePreset.OwnedPlacementRule.both, forcedPriority: 5,
+                        placeClosestTo: near, ignoreLimits: true);
+                }
+                catch (Exception pe) { Log($"Place: PlaceObject THREW for base-clone '{pn}': {pe.GetType().Name}: {pe.Message}"); return null; }
+                if (it == null) { Log($"Place: PlaceObject returned NULL for base-clone '{pn}' at loc '{SafeLocName(loc)}' - this drug item did NOT go into the lab stash."); return null; }
+                if (owner != null) { try { it.AddNewDynamicFingerprint(owner, Interactable.PrintLife.timed); } catch { } }
                 ClearOwner(it);   // keep the fingerprint (above) but drop ownership so taking it isn't theft
                 return it;
             }
@@ -381,6 +388,8 @@ namespace Narcotics
             catch { return false; }
         }
 
+        private static string SafePresetName(InteractablePreset p) { try { if (!string.IsNullOrEmpty(p.presetName)) return p.presetName; } catch { } try { return p.name; } catch { return "?"; } }
+        private static string SafeLocName(NewGameLocation l) { try { return l.name; } catch { return "?"; } }
         static void Log(string m) => NarcoticsPlugin.Log.LogInfo("[Narcotics][dose] " + m);
     }
 }

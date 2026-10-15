@@ -227,16 +227,14 @@ namespace Narcotics
                 // the normal "place/throw"): null the weapon preset so the dose behaves like a regular object, matching the
                 // other drug items. (weapon is the only weapon field on InteractablePreset.)
                 try { clone.weapon = null; } catch (Exception e) { Log($"CreateDrug: clear weapon failed: {e.Message}"); }
-                // FINGERPRINTS (the forensic trail): some bases (syringe / insulin injector / birth control pills) ship
-                // with dynamic prints effectively OFF - the flags off AND/OR the dynamic-print count capped at 0 - so
-                // handling never stamped a print (dusting showed nothing). Force the whole set on: enable flags, lift any
-                // zero cap (override + a sane max), and ensure non-zero density, so every base stamps prints like the boxes.
-                try { clone.fingerprintsEnabled = true; } catch { }
-                try { clone.enableDynamicFingerprints = true; } catch { }
-                try { clone.disableDynamicFingerprintsFromStaticPrintsSources = false; } catch { }
-                try { clone.overrideMaxDynamicFingerprints = true; } catch { }
-                try { if (clone.maxDynamicFingerprints < 10) clone.maxDynamicFingerprints = 10; } catch { }
-                try { if (clone.fingerprintDensity <= 0f) clone.fingerprintDensity = 1f; } catch { }
+                // DO NOT force fingerprint flags on the clone. An earlier version set fingerprintsEnabled /
+                // enableDynamicFingerprints / overrideMaxDynamicFingerprints / maxDynamicFingerprints / fingerprintDensity
+                // to try to make the thin items (syringe / insulin injector / birth control pills) dustable. Those items
+                // have NO print surface, so it never worked - AND forcing a non-zero fingerprintDensity on a surface-less
+                // item makes PlaceObject FAIL to spawn it, so the cook's dose never reached the lab stash and the whole
+                // supply chain stalled for exactly those three bases. We leave each base's native fingerprint config
+                // alone: box/bottle bases keep their real prints, the thin bases stay non-dustable (an art limit), and
+                // every base places into the stash again. (Handling still stamps a dynamic print via Dose.Create/Place.)
 
                 // The card's examine DESCRIPTION (the writeup under the item photo) is substituted per-dose by a Harmony
                 // patch on the writeup getter (Patch_DrugItemDescription in Diagnostics.cs), NOT by touching the evidence
