@@ -96,6 +96,29 @@ namespace Narcotics
             return locked;
         }
 
+        // CLOSE (but do NOT lock) the lab's entrance door(s). NPCs (the cook) leave the door standing wide open after
+        // passing through, which looks wrong for a secret lab; closing it keeps it discreet. We deliberately don't LOCK
+        // it - the lab is a vacant unit the cook doesn't own, so a locked door would trap the cook out (that's why full
+        // private-lab locking is parked). An unlocked closed door still opens for the cook when they path through.
+        internal static int CloseLab(NewGameLocation lab)
+        {
+            int closed = 0;
+            try
+            {
+                if (lab == null) return 0;
+                var ents = lab.entrances; if (ents == null) return 0;
+                for (int i = 0; i < ents.Count; i++)
+                {
+                    var e = ents[i]; if (e == null) continue;
+                    NewDoor d = null; try { d = e.door; } catch { }
+                    if (d == null) continue;
+                    try { if (!d.isClosed) { d.SetOpen(0f, null, false, 1f); closed++; } } catch { }
+                }
+            }
+            catch { }
+            return closed;
+        }
+
         // Unlock (and leave closed) the lab's door(s) so a released cook is not trapped behind a locked door
         // after we strip their ownership. Returns the number of doors unlocked.
         internal static int UnlockLab(NewGameLocation lab, Human actor)
@@ -137,37 +160,99 @@ namespace Narcotics
 
         // Dress a room in the lab with lab-reading furniture clusters. Best-effort: reliable when the lab
         // geometry is streamed (stand in the lab and call it). Distant addresses may have no rooms loaded yet.
-        internal static int DressLab(NewGameLocation lab)
+        // Dress EVERY room of the lab and return the cluster-locations placed (so the caller can REVERT them when the
+        // case resolves). rooms[0] can be a non-furnishable room (solver null), so trying all rooms lands the equipment
+        // in whichever room(s) can host it.
+        internal static List<FurnitureClusterLocation> DressLab(NewGameLocation lab)
         {
-            int placed = 0;
+            var placed = new List<FurnitureClusterLocation>();
             try
             {
-                if (lab == null) return 0;
+                if (lab == null) return placed;
                 var rooms = lab.rooms;
-                if (rooms == null || rooms.Count == 0) { Log("DressLab: no rooms streamed (stand in the lab and retry)."); return 0; }
-                NewRoom room = null;
-                for (int i = 0; i < rooms.Count; i++) { var r = rooms[i]; if (r != null) { room = r; break; } }
-                if (room == null) return 0;
+                if (rooms == null || rooms.Count == 0) { Log("DressLab: no rooms streamed (be in the lab and retry)."); return placed; }
+                for (int i = 0; i < rooms.Count; i++) { var r = rooms[i]; if (r != null) placed.AddRange(DressRoom(r, false)); }
+            }
+            catch (Exception e) { Log($"DressLab error: {e.Message}"); }
+            return placed;
+        }
 
+        // Place the lab-equipment clusters into a SPECIFIC room; returns the cluster-locations added. Shared by DressLab
+        // and the TestSpawnFurniture debug key (the player's current room). `verbose` logs each cluster's result.
+        internal static List<FurnitureClusterLocation> DressRoom(NewRoom room, bool verbose)
+        {
+            var placed = new List<FurnitureClusterLocation>();
+            try
+            {
+                if (room == null) { if (verbose) Log("DressRoom: null room."); return placed; }
                 var clusters = FindLabClusters();
-                if (clusters.Count == 0) { Log("DressLab: no lab clusters found in Toolbox.allFurnitureClusters."); return 0; }
+                if (clusters.Count == 0) { Log("DressRoom: no lab clusters found in Toolbox.allFurnitureClusters."); return placed; }
                 var gc = GenerationController.Instance;
-                if (gc == null) return 0;
+                if (gc == null) return placed;
                 foreach (var cluster in clusters)
                 {
                     try
                     {
                         var loc = gc.GetBestFurnitureClusterLocation(room, cluster, false, true);
-                        if (loc == null) continue;
+                        if (loc == null) { if (verbose) Log($"DressRoom: no placement location for '{ClName(cluster)}' in '{RName(room)}'."); continue; }
                         room.AddFurniture(loc, true, true, true, true, null);   // generateNew, addPathBlocking, immediateSpawn, ignoreLimitations
-                        placed++;
+                        placed.Add(loc);
+                        if (verbose) Log($"DressRoom: placed '{ClName(cluster)}' in '{RName(room)}'.");
                     }
-                    catch (Exception e) { Log($"DressLab: place '{ClName(cluster)}' failed: {e.Message}"); }
+                    catch (Exception e) { Log($"DressRoom: place '{ClName(cluster)}' failed: {e.Message}"); }
                 }
-                Log($"DressLab: placed {placed} lab cluster(s) in room '{RName(room)}'.");
+                if (!verbose || placed.Count > 0) Log($"DressRoom: placed {placed.Count} lab cluster(s) in room '{RName(room)}'.");
             }
-            catch (Exception e) { Log($"DressLab error: {e.Message}"); }
+            catch (Exception e) { Log($"DressRoom error: {e.Message}"); }
             return placed;
+        }
+
+        // Revert the lab equipment we added (remove the clusters + their spawned interactables), so the unit goes back
+        // to the bare vacant shell when the case resolves.
+        internal static int StripFurniture(List<FurnitureClusterLocation> placed)
+        {
+            int removed = 0;
+            try
+            {
+                if (placed == null) return 0;
+                for (int i = 0; i < placed.Count; i++)
+                {
+                    var loc = placed[i]; if (loc == null) continue;
+                    // DeleteCluster leaves some WALL-HUNG items behind (e.g. the SciencePictureLab wall picture), so first
+                    // SafeDelete every spawned + integrated interactable the cluster holds, directly, as a belt+braces sweep.
+                    try
+                    {
+                        var cl = loc.clusterList;
+                        if (cl != null)
+                        {
+                            for (int c = 0; c < cl.Count; c++)
+                            {
+                                var fl = cl[c]; if (fl == null) continue;
+                                try { SafeDeleteAll(fl.spawnedInteractables); } catch { }
+                                try { SafeDeleteAll(fl.integratedInteractables); } catch { }
+                            }
+                        }
+                    }
+                    catch (Exception e) { Log($"StripFurniture: interactable sweep failed: {e.Message}"); }
+                    try { loc.DeleteCluster(true, FurnitureClusterLocation.RemoveInteractablesOption.remove); removed++; }
+                    catch (Exception e) { Log($"StripFurniture: delete failed: {e.Message}"); }
+                }
+            }
+            catch (Exception e) { Log($"StripFurniture error: {e.Message}"); }
+            return removed;
+        }
+
+        // SafeDelete every interactable in an il2cpp list (copies refs first - SafeDelete mutates the world lists).
+        private static void SafeDeleteAll(Il2CppSystem.Collections.Generic.List<Interactable> list)
+        {
+            try
+            {
+                if (list == null) return;
+                var refs = new List<Interactable>();
+                for (int i = 0; i < list.Count; i++) { try { var it = list[i]; if (it != null) refs.Add(it); } catch { } }
+                for (int i = 0; i < refs.Count; i++) { try { refs[i].SafeDelete(false); } catch { } }
+            }
+            catch { }
         }
 
         private static readonly string[] LabClusterNames = { "Machinery01", "Machinery02", "Machinery03", "EEGMachine", "WorkbenchAgainstWall", "SciencePictureLab", "MedicineCabinet", "MedicineCart" };

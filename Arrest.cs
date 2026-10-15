@@ -22,18 +22,24 @@ namespace Narcotics
         private enum Phase { Approach, Detain }
         private static Phase _phase;
         private static bool _openCase;         // open/feed the custom Case when this subject is restrained
-        private static float _holdUntilHours;  // game hours: keep them cuffed in place until this time (or case solved)
         private static NewNode _subjectNode;   // where the subject collapsed - we pin them here so they don't drift off
         private static NewGameLocation _subjectLoc;
-        private static NewNode _guardNode;     // primary guard post (building entrance / location anchor) - "near the door"
-        private static NewNode _guardNode2;    // fallback guard post (where the officer restrained them, ~1.8m from the suspect)
-        private static NewGameLocation _guardLoc;
-        private static float _deadline;        // real-time seconds (give enforcers time to travel)
+        private static float _approachStartGT; // in-game hours (SessionData.gameTime) when the approach began
         private static float _nextReassert;    // real-time seconds; keep the subject visibly erratic
-        internal static bool SubjectSearched;  // set by the OnSearch patch when the player frisks the arrestee
+        internal static bool SubjectSearched;  // set by the OnSearch patch when the player frisks the active arrestee
+
+        // POSTED arrests: once a subject is cuffed, it is handed off from the single approach-machine into this list,
+        // which keeps each one restrained (officer leaning nearby) until the hold ends or the case is solved. This frees
+        // the approach-machine (Active=false) immediately, so the NEXT overdose can fire instead of the whole queue
+        // blocking for the ~12h a subject stays cuffed. Multiple cuffed buyers can coexist for the player to interrogate.
+        private sealed class Posted { public Human Subject; public Human Enforcer; public NewGameLocation GuardLoc; public float NextWander; public float HoldUntil; public bool OpenCase; public bool Searched; }
+        private static readonly List<Posted> _posted = new List<Posted>();
+        private static readonly System.Random _rng = new System.Random();
 
         private const float ContactM = 1.8f;
-        private const float ApproachTimeoutSec = 40f;   // if no enforcer reaches the subject by now, self-arrest so the case still opens
+        // Backstop measured in IN-GAME time (not real seconds) so fast-forward doesn't stretch it: if the officer hasn't
+        // reached the subject by now, teleport them adjacent (or self-arrest if no officer at all) so the case opens.
+        private const float ArrestApproachMinutes = 5f;
         private static float _nextApproachLog;
 
         // F8 (debug): overdose the NEAREST NPC and arrest them. Also opens the case, so the full chain end can be
@@ -63,7 +69,7 @@ namespace Narcotics
                 if (subject == null || Dead(subject)) { Log("Begin: no valid subject."); return false; }
                 Reset();
                 Subject = subject; Enforcer = null; Active = true; _phase = Phase.Approach; _openCase = openCase;
-                _deadline = Time.time + ApproachTimeoutSec; _nextReassert = 0f; _nextApproachLog = 0f; SubjectSearched = false;
+                _approachStartGT = Herd.NowHours(); _nextReassert = 0f; _nextApproachLog = 0f; SubjectSearched = false;
                 try { subject.AddDrunk(2f); } catch { }
                 try { subject.AddSick(1.5f); } catch { }
 
@@ -74,9 +80,11 @@ namespace Narcotics
                 // Capture their spot now and hold them there (Approach re-asserts it) until the officer restrains them.
                 _subjectNode = null; _subjectLoc = loc; try { _subjectNode = subject.currentNode; } catch { }
                 if (_subjectNode != null) { try { Herd.ToNode(subject, _subjectNode, loc, 0.5f); } catch { } }
-                try { var gc = GameplayController.Instance; if (gc != null && loc != null) gc.CallEnforcers(loc, false, false, 0f); }
-                catch (Exception e) { Log($"CallEnforcers threw: {e.Message}"); }
-                Log($"OVERDOSE: {NarcoticsPlugin.Name(subject)} is erratic; enforcers called to {locName} + nearest one dispatched to arrest (openCase={openCase}). Teleport (F10) to watch.");
+                // NOTE: we deliberately do NOT call GameplayController.CallEnforcers anymore. It dispatched the whole
+                // enforcer response to the location, which made them try to set up a CRIME SCENE out of the venue (e.g.
+                // a tavern) - buggy + unwanted. We drive the ONE nearest uniformed officer ourselves (the Approach
+                // machine) to restrain the subject and then potter around them; no crime scene, no venue cordon.
+                Log($"OVERDOSE: {NarcoticsPlugin.Name(subject)} is erratic at {locName}; driving the nearest officer to arrest (openCase={openCase}). Teleport (F10) to watch.");
                 return true;
             }
             catch (Exception e) { Log($"Begin error: {e.Message}"); return false; }
@@ -84,6 +92,7 @@ namespace Narcotics
 
         internal static void Tick()
         {
+            try { TickPosted(); } catch (Exception e) { Log($"TickPosted error: {e.Message}"); }   // keep every cuffed subject held, independent of the approach-machine
             if (!Active) return;
             try
             {
@@ -106,65 +115,172 @@ namespace Narcotics
                         _nextApproachLog = Time.time + 8f;
                         Log($"arrest: approaching - enforcer={(Enforcer != null ? NarcoticsPlugin.Name(Enforcer) : "<none available>")}.");
                     }
-                    // Self-arrest fallback: if no enforcer reaches the subject in time (they may all be busy with the
-                    // city's other crimes - the freeze you saw), open the case anyway so it is always workable. The
-                    // buyer stays cuffed in place; the officer guard is simply skipped (no officer to post).
-                    if (Time.time > _deadline)
+                    // Drive the officer to the subject's STABLE pinned node - NOT Herd.ToActor on the live node, which
+                    // (because the drunk subject stumbles between adjacent nodes) recreated the officer's goal every
+                    // tick, so the pathfinder never settled and he never closed the last 1.8m (the "2 in-game days" bug).
+                    bool reached = Enforcer != null && _subjectNode != null
+                                   && Herd.ToNode(Enforcer, _subjectNode, _subjectLoc, ContactM, ResponseGoal());
+
+                    // Backstop in IN-GAME time (fast-forward-proof): if the officer hasn't reached in time, teleport them
+                    // adjacent to the subject (reliable, restrain this tick); if no officer exists at all, self-arrest
+                    // the subject in place so the case still opens.
+                    bool timedOut = Herd.NowHours() - _approachStartGT >= ArrestApproachMinutes / 60f;
+                    if (!reached && timedOut)
                     {
-                        Log("arrest: no enforcer reached in time - SELF-ARREST fallback so the case still opens.");
-                        try { Herd.Release(Subject); } catch { }
-                        try { Subject.ai.SetRestrained(true, 2f); } catch { }
-                        _phase = Phase.Detain;
-                        _holdUntilHours = Herd.NowHours() + Math.Max(0.25f, NarcoticsConfig.ArrestHoldHours);
-                        if (_openCase) { try { NarcCase.Open(Subject); } catch (Exception e) { Log($"case open error: {e.Message}"); } }
-                        _guardNode = null; _guardNode2 = null; _guardLoc = null;
-                        return;
-                    }
-                    if (Enforcer == null) return;                              // none available yet - wait
-                    if (Herd.ToActor(Enforcer, Subject, ContactM, ResponseGoal()))   // urgent alarm-response stance, not a stroll
-                    {
-                        try { Herd.Release(Subject); } catch { }   // drop the hold-in-place pin; SetRestrained keeps them now
-                        try { Subject.ai.SetRestrained(true, 2f); } catch { }
-                        _phase = Phase.Detain;
-                        _holdUntilHours = Herd.NowHours() + Math.Max(0.25f, NarcoticsConfig.ArrestHoldHours);
-                        if (_openCase) { try { NarcCase.Open(Subject); } catch (Exception e) { Log($"case open error: {e.Message}"); } }
-                        // Post the officer at the scene's building ENTRANCE to guard it (like a vanilla officer by the
-                        // crime-scene door), NOT on top of the suspect (that blocked talking to them), and have them
-                        // WALK there, not sprint. We avoid the vanilla enforcerGuardDuty goal: its locationOption is
-                        // murderLocation, which with no real murder-location object falls back onto the suspect (that
-                        // was the "stood on top" bug). Fallback post: where the officer is standing now (a step from
-                        // the suspect) if there is no building entrance (street scenes).
-                        _guardNode = null; _guardNode2 = null; _guardLoc = null;
-                        try { _guardNode2 = Enforcer.currentNode; } catch { }   // scene side (~1.8m from the suspect)
-                        try
+                        if (Enforcer != null)
                         {
-                            var l = Subject.currentGameLocation; _guardLoc = l;
-                            NewNode far = null;
-                            try { var bld = l != null ? l.building : null; var w = bld != null ? bld.mainEntrance : null; far = w != null ? w.node : null; } catch { }
-                            if (far == null) { try { far = l != null ? l.anchorNode : null; } catch { } }   // street scene: the location anchor
-                            _guardNode = far;
+                            try { Enforcer.Teleport(AdjacentWalkable(_subjectNode) ?? _subjectNode, null, true, false, true); } catch (Exception e) { Log($"enforcer teleport threw: {e.Message}"); }
+                            Log($"arrest: {NarcoticsPlugin.Name(Enforcer)} couldn't path in time - teleported to the scene.");
+                            reached = true;
                         }
-                        catch { }
-                        if (_guardNode == null) _guardNode = _guardNode2;
-                        if (_guardNode2 == null) _guardNode2 = _guardNode;
-                        Log($"ARREST: {NarcoticsPlugin.Name(Subject)} restrained; officer {NarcoticsPlugin.Name(Enforcer)} is patrolling the scene. Cuffed ~{NarcoticsConfig.ArrestHoldHours:0}h (or until solved) - talk to / search them.");
+                        else
+                        {
+                            Log("arrest: no uniformed officer available - SELF-ARREST fallback so the case still opens.");
+                            EnterDetain(true);
+                            return;
+                        }
                     }
-                }
-                else // Detain: keep the subject cuffed; the officer posts up NEAR the suspect and LEANS ON A WALL
-                     // (walks there, no sprinting, no ping-ponging) like an enforcer loitering at a vanilla scene.
-                {
-                    try { Subject.ai.SetRestrained(true, 2f); } catch { }   // re-assert or they stand up (keeps them in place)
-                    if (Enforcer != null && !Dead(Enforcer))
-                    {
-                        var target = _guardNode2 ?? _guardNode;   // the spot by the suspect (~1.8m); entrance only as fallback
-                        if (target != null) Herd.ToNode(Enforcer, target, _guardLoc, 1.0f, LeanGoal() ?? WalkGoal());
-                        Calm(Enforcer);   // clear the urgent alarm-response state left from the approach so they WALK, not run
-                    }
-                    if (_openCase && NarcCase.IsSolved()) { Log($"case solved - releasing {NarcoticsPlugin.Name(Subject)}."); Finish(); return; }
-                    if (Herd.NowHours() >= _holdUntilHours) { Log($"{NarcoticsPlugin.Name(Subject)} held the full {NarcoticsConfig.ArrestHoldHours:0}h - releasing."); Finish(); return; }
+                    if (!reached) return;   // still walking over
+                    EnterDetain(false);     // cuff + hand off to the posted list, freeing the machine for the next overdose
                 }
             }
             catch (Exception e) { Log($"Tick error: {e.Message}"); Reset(); }
+        }
+
+        // Keep every handed-off (cuffed) subject restrained, with its officer posted/leaning nearby, until the case is
+        // solved or the hold elapses. Runs every tick regardless of the approach-machine, so arrests accumulate.
+        private static void TickPosted()
+        {
+            if (_posted.Count == 0) return;
+            bool solved = false; try { solved = NarcCase.IsSolved(); } catch { }
+            for (int i = _posted.Count - 1; i >= 0; i--)
+            {
+                var p = _posted[i];
+                if (p == null || Dead(p.Subject)) { if (p != null) ReleasePosted(p); _posted.RemoveAt(i); continue; }
+                try { p.Subject.ai.SetRestrained(true, 2f); } catch { }   // re-assert or they stand up
+                if (p.Enforcer != null && !Dead(p.Enforcer))
+                {
+                    // Hand the officer to its OWN vanilla patrol coroutine around the arrest location (NewAIController.Patrol)
+                    // rather than hand-driving it node-to-node and forcing arm/weapon state each tick (which made it walk
+                    // with arms stuck out and the gun drawn). Patrol is the cop's normal mill-around-the-area routine:
+                    // natural gait, holstered weapon, no door-blocking. Re-assert it every ~20s (and drop any leftover Herd
+                    // pin from the approach so the goal can run) in case the officer's shift or another goal interrupts.
+                    if (Time.time >= p.NextWander)
+                    {
+                        try { Herd.Release(p.Enforcer); } catch { }
+                        try { if (p.GuardLoc != null) p.Enforcer.ai.Patrol(p.GuardLoc); } catch { }
+                        p.NextWander = Time.time + 20f;
+                    }
+                }
+                if ((p.OpenCase && solved) || Herd.NowHours() >= p.HoldUntil)
+                {
+                    Log($"{NarcoticsPlugin.Name(p.Subject)} released (arrest complete; {_posted.Count - 1} scene(s) still active).");
+                    ReleasePosted(p); _posted.RemoveAt(i);
+                }
+            }
+        }
+
+        private static void ReleasePosted(Posted p)
+        {
+            try { if (p != null && p.Subject != null) { try { Herd.Release(p.Subject); } catch { } try { p.Subject.ai.SetRestrained(false, 0f); } catch { } } } catch { }
+            try { if (p != null && p.Enforcer != null) Herd.Release(p.Enforcer); } catch { }
+            // Clear this arrestee's "Search <name>" objective + its HUD pointer when they're let go, so a released NPC
+            // doesn't leave a dangling POI stuck at the old arrest spot. (On a case RESOLUTION this runs via Arrest.Stop,
+            // which fires BEFORE NarcCase.MarkClosed, so the case is still open and ClearLeadFor can find + cancel it.)
+            try { if (p != null && p.Subject != null) NarcCase.ClearLeadFor(p.Subject.humanID, "released from arrest"); } catch { }
+        }
+
+        private static void ReleaseAllPosted() { try { for (int i = 0; i < _posted.Count; i++) if (_posted[i] != null) ReleasePosted(_posted[i]); } catch { } _posted.Clear(); }
+
+        // Transition Approach -> Detain: cuff the subject in place, open the case, and (unless this was a no-officer
+        // self-arrest) cache the guard posts the officer loiters at. Factored out so both the "officer reached /
+        // teleported in" path and the "no officer at all" fallback restrain + open identically.
+        private static void EnterDetain(bool selfArrest)
+        {
+            try { Herd.Release(Subject); } catch { }   // drop the hold-in-place pin; SetRestrained keeps them now
+            try { Subject.ai.SetRestrained(true, 2f); } catch { }
+            if (_openCase) { try { NarcCase.OnSubjectArrested(Subject); } catch (Exception e) { Log($"case open error: {e.Message}"); } }
+            try { Operation.OnArrestMade(); } catch { }   // start the "next overdose no sooner than X after THIS arrest" clock
+
+            var p = new Posted
+            {
+                Subject = Subject,
+                Enforcer = selfArrest ? null : Enforcer,
+                OpenCase = _openCase,
+                HoldUntil = Herd.NowHours() + Math.Max(0.25f, NarcoticsConfig.ArrestHoldHours),
+                Searched = false,
+            };
+            if (p.Enforcer != null)
+            {
+                // Hand the officer to its OWN vanilla patrol routine around the arrest location (so it mills about the
+                // scene with a natural gait + holstered weapon, not standing on the suspect or blocking a door). Release
+                // the approach's Herd pin first so the vanilla goal can actually run; TickPosted re-asserts it.
+                try { p.GuardLoc = Subject.currentGameLocation; } catch { }
+                try { Herd.Release(Enforcer); } catch { }
+                try { if (p.GuardLoc != null) Enforcer.ai.Patrol(p.GuardLoc); } catch { }
+                Log($"ARREST: {NarcoticsPlugin.Name(Subject)} restrained; officer {NarcoticsPlugin.Name(Enforcer)} set to patrol the scene. Cuffed ~{NarcoticsConfig.ArrestHoldHours:0}h (or until solved). {_posted.Count + 1} scene(s) active.");
+            }
+            else { Log($"ARREST: {NarcoticsPlugin.Name(Subject)} restrained in place (no officer posted). {_posted.Count + 1} scene(s) active."); }
+
+            _posted.Add(p);
+            ClearActive();   // free the approach-machine for the next overdose; the Posted record now owns this subject
+        }
+
+        // Null the approach-machine state WITHOUT releasing the subject (a Posted record owns it now). Distinct from
+        // Reset(), which releases the subject (used when an in-progress APPROACH is aborted).
+        private static void ClearActive()
+        {
+            Active = false; Enforcer = null; Subject = null; _phase = Phase.Approach; _openCase = false;
+            _subjectNode = null; _subjectLoc = null; SubjectSearched = false;
+        }
+
+        // Is `id` a subject currently being arrested (approaching) or cuffed (posted)? Used to never sell to an arrestee.
+        internal static bool IsArrestee(int id)
+        {
+            try
+            {
+                if (Active && Subject != null && Subject.humanID == id) return true;
+                for (int i = 0; i < _posted.Count; i++) { var p = _posted[i]; if (p != null && p.Subject != null && p.Subject.humanID == id) return true; }
+            }
+            catch { }
+            return false;
+        }
+
+        // Is `id` an officer already tied up at a scene (approaching or posted)? Used so a second arrest picks a different officer.
+        private static bool IsPostedEnforcer(int id)
+        {
+            try
+            {
+                if (Enforcer != null && Enforcer.humanID == id) return true;
+                for (int i = 0; i < _posted.Count; i++) { var p = _posted[i]; if (p != null && p.Enforcer != null && p.Enforcer.humanID == id) return true; }
+            }
+            catch { }
+            return false;
+        }
+
+        // A walkable node adjacent to `n`, so a teleported officer lands a step away (not on top of the suspect).
+        // Falls back to `n` itself if there is no good neighbour - harmless, the guard post re-places them next tick.
+        private static NewNode AdjacentWalkable(NewNode n)
+        {
+            try
+            {
+                if (n == null) return n;
+                var acc = n.accessToOtherNodes;
+                if (acc != null)
+                {
+                    foreach (var kv in acc)
+                    {
+                        var nb = kv.Key; var a = kv.Value;
+                        if (nb == null || a == null) continue;
+                        bool walk = false; try { walk = a.walkingAccess; } catch { }
+                        if (!walk) continue;
+                        bool bad = false; try { bad = nb.isObstacle || nb.isInaccessable || nb.noAccess || !nb.isConnected; } catch { }
+                        if (!bad) return nb;
+                    }
+                }
+            }
+            catch { }
+            return null;   // NEVER fall back to `n` itself - that put the officer on top of the suspect; no neighbour => leave unposted
         }
 
         // Release the subject back to their routine (never RemoveFromWorld - possession is minor, keeps them
@@ -186,36 +302,50 @@ namespace Narcotics
             try
             {
                 if (!Active || Subject == null) { Log("no active arrest (press the overdose key first)."); return; }
-                var player = Player.Instance; if (player == null) return;
-                NewNode node = null; try { node = Subject.currentNode; } catch { }
-                if (node == null) { Log("subject has no node yet."); return; }
-                player.Teleport(node, null, true, false, true);
+                if (!Diagnostics.TeleportOnto(Subject)) { Log("subject has no node yet."); return; }   // land right on the subject
                 string enf = Enforcer != null ? NarcoticsPlugin.Name(Enforcer) : "(awaiting enforcer)";
                 Log($"teleported to the arrest: subject {NarcoticsPlugin.Name(Subject)}, enforcer {enf} (phase {_phase}).");
             }
             catch (Exception e) { Log($"TeleportToPair error: {e.Message}"); }
         }
 
-        internal static void Stop() { if (Active) Finish(); }
+        internal static void Stop() { try { ReleaseAllPosted(); } catch { } if (Active) Finish(); }
 
-        // Called by the OnSearch Harmony patch when the player frisks the current arrestee. The search no longer
-        // releases them (they stay cuffed the full hold); it just confirms the dose is now revealed and nudges the
-        // player to pin it - the whole point of holding them is so a forgotten pin can still be fixed.
-        internal static void NotifySearched()
+        // Called by the OnSearch Harmony patch when the player frisks an arrestee (approaching OR posted). Matches by
+        // humanID so searching one of several cuffed buyers marks the right one. The search doesn't release them (they
+        // stay cuffed the full hold); it just confirms the dose is now revealed and nudges the player to pin it.
+        internal static void NotifySearched(Human h)
         {
-            if (!Active || SubjectSearched) return;
-            SubjectSearched = true;
-            Log($"player searched {NarcoticsPlugin.Name(Subject)} - their dose is now known evidence. Pin it to the case board (they stay cuffed, so you can come back).");
+            try
+            {
+                if (h == null) return;
+                int id; try { id = h.humanID; } catch { return; }
+                if (Active && Subject != null && Subject.humanID == id)
+                {
+                    if (!SubjectSearched) { SubjectSearched = true; Log($"player searched {NarcoticsPlugin.Name(h)} - their dose is now known evidence."); }
+                    return;
+                }
+                for (int i = 0; i < _posted.Count; i++)
+                {
+                    var p = _posted[i];
+                    if (p != null && p.Subject != null && p.Subject.humanID == id)
+                    {
+                        if (!p.Searched) { p.Searched = true; Log($"player searched {NarcoticsPlugin.Name(h)} - their dose is now known evidence. Pin it to the case board (they stay cuffed)."); }
+                        return;
+                    }
+                }
+            }
+            catch { }
         }
 
         private static void Reset()
         {
             try { if (Subject != null) { try { Herd.Release(Subject); } catch { } try { Subject.ai.SetRestrained(false, 0f); } catch { } } } catch { }
             try { if (Enforcer != null) Herd.Release(Enforcer); } catch { }
-            Active = false; Enforcer = null; Subject = null; _phase = Phase.Approach; _openCase = false; _guardNode = null; _guardNode2 = null; _guardLoc = null; _subjectNode = null; _subjectLoc = null; SubjectSearched = false;
+            Active = false; Enforcer = null; Subject = null; _phase = Phase.Approach; _openCase = false; _subjectNode = null; _subjectLoc = null; SubjectSearched = false;
         }
 
-        internal static void ResetOnLoad() { Active = false; Enforcer = null; Subject = null; _phase = Phase.Approach; _openCase = false; _guardNode = null; _guardNode2 = null; _guardLoc = null; _subjectNode = null; _subjectLoc = null; SubjectSearched = false; }
+        internal static void ResetOnLoad() { Active = false; Enforcer = null; Subject = null; _phase = Phase.Approach; _openCase = false; _subjectNode = null; _subjectLoc = null; SubjectSearched = false; _posted.Clear(); }
 
         // Nearest living citizen to a point (excluding the player, and optionally a humanID to skip).
         private static Human NearestNPC(Vector3 pos, int skipId)
@@ -259,6 +389,8 @@ namespace Narcotics
                     Human h = null;
                     try { h = list[i]; } catch { }
                     if (h == null || Dead(h)) continue;
+                    int id; try { id = h.humanID; } catch { continue; }
+                    if (IsPostedEnforcer(id)) continue;   // don't reuse an officer already tied up at another scene
                     if (!IsUniformed(h)) continue;   // exclude plainclothes/off-duty enforcers (vanilla sends uniformed responders)
                     NewNode hn = null; try { hn = h.currentNode; } catch { }
                     if (hn == null) continue;
@@ -290,63 +422,6 @@ namespace Narcotics
         {
             try { var rc = RoutineControls.Instance; if (rc != null) return rc.enforcerResponse; } catch { }
             return null;
-        }
-
-        // The vanilla WALK-to goal (toGoWalkGoal). The default toGoGoal RUNS (its move action forces running), which
-        // is what made the guarding officer sprint back and forth; toGoWalkGoal is the same goal tuned to walk. Null
-        // -> Herd falls back to the running goal.
-        private static AIGoalPreset WalkGoal()
-        {
-            try { var rc = RoutineControls.Instance; if (rc != null) return rc.toGoWalkGoal; } catch { }
-            return null;
-        }
-
-        // A one-time clone of toGoWalkGoal tuned to make the posted officer LEAN ON A WALL near the suspect (vanilla's
-        // standAgainstWall idle) instead of standing stiffly. We clone (never mutate the shared preset, which every
-        // enforcer uses) and enable pottering with standAgainstWall as the only potter action, sourced from this
-        // config, located at the node we herd to. Same Instantiate+DontDestroyOnLoad pattern as the drug-item clone.
-        private static AIGoalPreset _leanGoal;
-        private static AIGoalPreset LeanGoal()
-        {
-            try
-            {
-                if (_leanGoal != null) return _leanGoal;
-                var rc = RoutineControls.Instance; if (rc == null) return null;
-                var baseGoal = rc.toGoWalkGoal; if (baseGoal == null) return null;
-                AIGoalPreset clone = null;
-                try { clone = UnityEngine.Object.Instantiate(baseGoal).TryCast<AIGoalPreset>(); } catch (Exception e) { Log($"LeanGoal clone threw: {e.Message}"); }
-                if (clone == null) return null;
-                try { clone.allowPottering = true; } catch { }
-                try { clone.potterSource = AIGoalPreset.GoalActionSource.thisConfiguration; } catch { }   // use OUR potterActions list
-                try { clone.locationOption = AIGoalPreset.LocationOption.passedGamelocation; } catch { }   // potter at the node we pass
-                try { clone.potterFrequency = new Vector2(2f, 6f); } catch { }
-                try
-                {
-                    var acts = new Il2CppSystem.Collections.Generic.List<AIActionPreset>();
-                    if (rc.standAgainstWall != null) acts.Add(rc.standAgainstWall);
-                    clone.potterActions = acts;
-                }
-                catch (Exception e) { Log($"LeanGoal potterActions threw: {e.Message}"); }
-                try { UnityEngine.Object.DontDestroyOnLoad(clone); } catch { }
-                _leanGoal = clone;
-                Log("built the lean-on-wall guard goal (standAgainstWall).");
-                return _leanGoal;
-            }
-            catch (Exception e) { Log($"LeanGoal build error: {e.Message}"); return null; }
-        }
-
-        // Clear the urgent alarm-response AI state (reaction + investigation urgency) carried over from the approach,
-        // so the officer's guard movement is a calm walk, not a pursuit run. isRunning is DERIVED from speed, so we
-        // set the urgency INPUTS (reactionState/investigationUrgency), never the output flag.
-        private static void Calm(Human enforcer)
-        {
-            try
-            {
-                var ai = enforcer != null ? enforcer.ai : null; if (ai == null) return;
-                try { ai.SetReactionState(NewAIController.ReactionState.none); } catch { }
-                try { ai.SetInvestigationUrgency(NewAIController.InvestigationUrgency.walk); } catch { }
-            }
-            catch { }
         }
 
         private static bool Dead(Human h) { try { return h == null || h.isDead; } catch { return false; } }

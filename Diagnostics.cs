@@ -18,7 +18,7 @@ namespace Narcotics
                 GameObject.DontDestroyOnLoad(go);
                 go.hideFlags = HideFlags.HideAndDontSave;
                 go.AddComponent<NarcoticsHotkey>();
-                NarcoticsPlugin.Log.LogInfo($"[Narcotics] Debug hotkeys (need [Debug] EnableDebugKeys): {NarcoticsConfig.KeyTeleportNPC}=teleport to next NPC, {NarcoticsConfig.KeyDropTeleport}=teleport to next dead drop, {NarcoticsConfig.KeyForceSale}=force a sale, {NarcoticsConfig.KeyStartOp}=start op, {NarcoticsConfig.KeyStopOp}=stop op, {NarcoticsConfig.KeyGodMode}=god mode, {NarcoticsConfig.KeyOverdose}=overdose nearest NPC, {NarcoticsConfig.KeyArrestTeleport}=teleport to subject, {NarcoticsConfig.KeyLogPanel}=log panel, {NarcoticsConfig.KeyTeleportLab}=to lab, {NarcoticsConfig.KeyDressLab}=dress lab, {NarcoticsConfig.KeyTimeBoost}=fast-forward, {NarcoticsConfig.KeyDump}=substrate dump.");
+                NarcoticsPlugin.Log.LogInfo($"[Narcotics] Debug hotkeys (need [Debug] EnableDebugKeys): {NarcoticsConfig.KeyTeleportNPC}=teleport to next NPC, {NarcoticsConfig.KeyDropTeleport}=teleport to next dead drop, {NarcoticsConfig.KeyForceSale}=force a sale, {NarcoticsConfig.KeyStartOp}=start op, {NarcoticsConfig.KeyStopOp}=stop op, {NarcoticsConfig.KeyGodMode}=god mode, {NarcoticsConfig.KeyOverdose}=overdose nearest NPC, {NarcoticsConfig.KeyArrestTeleport}=teleport to subject, {NarcoticsConfig.KeyLogPanel}=log panel, {NarcoticsConfig.KeyTeleportLab}=to lab, {NarcoticsConfig.KeyDressLab}=dress lab, {NarcoticsConfig.KeyTimeBoost}=fast-forward, {NarcoticsConfig.KeyUnlockComputer}=log into the computer you're using (skip password), {NarcoticsConfig.KeySpawnFurniture}=spawn lab furniture in your room (test), {NarcoticsConfig.KeyDump}=substrate dump.");
             }
             catch (Exception e) { NarcoticsPlugin.Log.LogWarning($"[Narcotics] hotkey register failed: {e.Message}"); }
         }
@@ -176,27 +176,76 @@ namespace Narcotics
 
         // DEBUG CHEAT: dump the current VANILLA murder's resolve answers (killer, where they live, weapon, scene), so
         // you can solve a real murder at City Hall and watch the vanilla success sequence to compare with ours.
+        // Dump every ACTIVE vanilla case (murder / sniper / KIDNAP) with its NPC pair + their home and work addresses,
+        // so a vanilla kidnapping can be inspected. Iterates MurderController.activeMurders (not just GetCurrentMurder),
+        // flags our own narcotics shell so it isn't mistaken for a real case, and prints the kidnap-specific fields.
         internal static void RevealMurder()
         {
             var log = NarcoticsPlugin.Log;
             try
             {
                 var mc = MurderController.Instance;
-                var m = mc != null ? mc.GetCurrentMurder() : null;
-                if (m == null) { log.LogInfo("[Narcotics][murder] no active murder right now (wait for one, or it may be solved)."); return; }
-                string mn = "?"; int mid = -1; string home = "?";
-                try { var h = m.murderer; if (h != null) { try { mn = h.citizenName; } catch { } try { mid = h.humanID; } catch { } try { if (h.home != null) home = h.home.name; } catch { } } } catch { }
-                string weapon = "?"; try { var w = m.weapon; if (w != null) weapon = w.GetName(); else if (m.weaponPreset != null) weapon = m.weaponPreset.name; } catch { }
-                string loc = "?"; try { if (m.location != null) loc = m.location.name; } catch { }
-                string vic = "?"; try { var v = m.victim; if (v != null) vic = v.citizenName; } catch { }
-                log.LogInfo("[Narcotics][murder] ===== VANILLA MURDER (cheat reveal) =====");
-                log.LogInfo($"[Narcotics][murder]  KILLER: {mn} #{mid}");
-                log.LogInfo($"[Narcotics][murder]  LIVES AT: {home}");
-                log.LogInfo($"[Narcotics][murder]  WEAPON: {weapon}");
-                log.LogInfo($"[Narcotics][murder]  MURDER SCENE: {loc}    VICTIM: {vic}");
-                log.LogInfo("[Narcotics][murder]  (collect the murder form at City Hall + answer these to watch the vanilla resolve sequence)");
+                if (mc == null) { log.LogInfo("[Narcotics][case] no MurderController (load a game first)."); return; }
+                var list = mc.activeMurders;
+                int n = 0; try { n = list != null ? list.Count : 0; } catch { }
+                MurderController.Murder cur = null; try { cur = mc.GetCurrentMurder(); } catch { }
+                log.LogInfo($"[Narcotics][case] ===== ACTIVE CASES (activeMurders={n}; narcoticsCaseActive={Operation.Active}) =====");
+                if (n == 0) { log.LogInfo("[Narcotics][case]  none right now - no active murder/sniper/kidnapping (wait for one, or it was solved)."); return; }
+                for (int i = 0; i < n; i++)
+                {
+                    MurderController.Murder m = null; try { m = list[i]; } catch { }
+                    if (m == null) continue;
+
+                    string type = "?"; try { var p = m.preset; if (p != null) type = p.caseType.ToString(); } catch { }
+                    string state = "?"; try { state = m.state.ToString(); } catch { }
+                    bool isCur = false; try { isCur = cur != null && m.Pointer == cur.Pointer; } catch { }
+                    log.LogInfo($"[Narcotics][case] --- case {i}: {type.ToUpperInvariant()}  state={state}{(isCur ? "  [current]" : "")} ---");
+
+                    Human killer = null, victim = null; try { killer = m.murderer; } catch { } try { victim = m.victim; } catch { }
+                    log.LogInfo($"[Narcotics][case]   {(type == "kidnap" ? "KIDNAPPER" : "PERPETRATOR")}: {WhoAddr(killer)}");
+                    log.LogInfo($"[Narcotics][case]   VICTIM:     {WhoAddr(victim)}");
+
+                    string scene = "?"; try { if (m.location != null) scene = m.location.name; } catch { }
+                    log.LogInfo($"[Narcotics][case]   scene/held-at (Murder.location): {scene}");
+                    if (type == "kidnap")
+                    {
+                        bool kp = false; int vs = -1, rs = -1, ad = -1, ra = -1; bool vss = false;
+                        try { kp = m.kidnapKillPhase; } catch { }
+                        try { vs = m.victimSiteID; } catch { } try { vss = m.victimSiteIsStreet; } catch { }
+                        try { rs = m.ransomSiteID; } catch { } try { ra = m.ransomAmount; } catch { } try { ad = m.addressID; } catch { }
+                        log.LogInfo($"[Narcotics][case]   KIDNAP: kidnapKillPhase={kp}  victimSiteID={vs}(street={vss})->{LocNameById(vs)}  ransomSiteID={rs}->{LocNameById(rs)}  ransom={ra}  addressID={ad}->{LocNameById(ad)}");
+                    }
+                }
+                log.LogInfo("[Narcotics][case] ===== END =====");
             }
-            catch (Exception e) { log.LogWarning($"[Narcotics][murder] reveal error: {e.Message}"); }
+            catch (Exception e) { log.LogWarning($"[Narcotics][case] reveal error: {e.Message}"); }
+        }
+
+        // "<name> #<id>  home: <address>  work: <company> @ <address>" - the NPC + both their addresses.
+        private static string WhoAddr(Human h)
+        {
+            if (h == null) return "<none>";
+            string nm = "?"; int id = -1; bool dead = false;
+            try { nm = h.citizenName; } catch { } try { id = h.humanID; } catch { } try { dead = h.isDead; } catch { }
+            string home = "?"; try { if (h.home != null) home = h.home.name; } catch { }
+            string work = "-";
+            try { var j = h.job; if (j != null) { var emp = j.employer; if (emp != null) { string cn = "?", ca = "?"; try { cn = emp.name; } catch { } try { if (emp.address != null) ca = emp.address.name; } catch { } work = $"{cn} @ {ca}"; } } } catch { }
+            return $"{nm} #{id}{(dead ? " (DEAD)" : "")}  home: {home}  work: {work}";
+        }
+
+        // Best-effort: resolve a Murder site/address id to a location name via the game's directories. The kidnap site
+        // ids may index the gameLocationDirectory; guard every access so a bad id just prints "?" rather than crashing.
+        private static string LocNameById(int id)
+        {
+            try
+            {
+                if (id < 0) return "-";
+                var cd = CityData.Instance; if (cd == null) return "?";
+                try { var gld = cd.gameLocationDirectory; if (gld != null && id < gld.Count) { var gl = gld[id]; if (gl != null) return gl.name; } } catch { }
+                try { var ad = cd.addressDirectory; if (ad != null && id < ad.Count) { var a = ad[id]; if (a != null) return a.name; } } catch { }
+                return "?";
+            }
+            catch { return "?"; }
         }
 
         // Teleport the player to City Hall (where the case resolution form is collected + submitted). Ported from
@@ -250,6 +299,93 @@ namespace Narcotics
         // verify inventories/positions after watching from the apartment. Logs who + their doses + distance to
         // their current target.
         private static int _npcCycle;
+        // Drop the player RIGHT ONTO an NPC (their exact world position), not merely into their location - a street
+        // node is too vague to find someone. Teleports to their node first (so streaming/pathing is correct), then
+        // snaps the player's transform onto the NPC. Returns false if it couldn't place them.
+        // TESTING: log into the computer the player is currently using WITHOUT its password, so surveillance footage
+        // can be checked quickly. Finds the player-controlled ComputerController and logs it in as the computer's owner
+        // (the account that already exists on it), which is what the password gate would otherwise do. Single-player
+        // debug convenience only.
+        internal static void UnlockActiveComputer()
+        {
+            var log = NarcoticsPlugin.Log;
+            try
+            {
+                var comps = UnityEngine.Object.FindObjectsOfType<ComputerController>();
+                if (comps == null || comps.Length == 0) { log.LogWarning("[Narcotics]  no computer in the loaded scene (sit at one first)."); return; }
+                int done = 0;
+                for (int i = 0; i < comps.Length; i++)
+                {
+                    var cc = comps[i]; if (cc == null) continue;
+                    bool pc = false; try { pc = cc.playerControlled; } catch { }
+                    if (!pc) continue;   // only the computer the player is actually using
+                    Human owner = null;
+                    try { owner = cc.ic != null ? cc.ic.belongsTo : null; } catch { }
+                    if (owner == null) { try { owner = Player.Instance; } catch { } }   // fallback: log in as the player
+                    if (owner == null) { log.LogWarning("[Narcotics]  computer has no owner account to log in as."); continue; }
+                    try { cc.SetLoggedIn(owner); done++; log.LogInfo($"[Narcotics]  logged into the computer as {NarcoticsPlugin.Name(owner)} - password bypassed. Open the Surveillance app."); }
+                    catch (Exception e) { log.LogWarning($"[Narcotics]  SetLoggedIn failed: {e.Message}"); }
+                }
+                if (done == 0) log.LogWarning("[Narcotics]  you aren't using a computer right now - sit at one (the login screen), then press the key.");
+            }
+            catch (Exception e) { log.LogWarning($"[Narcotics]  UnlockActiveComputer error: {e.Message}"); }
+        }
+
+        // TESTING: dump every active case's resolve-form questions (type + each question's fields) so we can see EXACTLY
+        // how vanilla wires the "arrest the suspect" checkmark (its reference to the naming question) and the location
+        // answer. Run a VANILLA murder (set HijackChance=0 for a run) then press the key while that case is on the board.
+        internal static void DumpResolveQuestions()
+        {
+            var log = NarcoticsPlugin.Log;
+            try
+            {
+                var cpc = CasePanelController.Instance; var cases = cpc != null ? cpc.activeCases : null;
+                if (cases == null || cases.Count == 0) { log.LogWarning("[Narcotics]  no active cases to dump"); return; }
+                for (int i = 0; i < cases.Count; i++)
+                {
+                    var c = cases[i]; if (c == null) continue;
+                    string ct = "?"; try { ct = c.caseType.ToString(); } catch { }
+                    string cn = "?"; try { cn = c.name; } catch { }
+                    var qs = c.resolveQuestions;
+                    log.LogInfo($"[Narcotics][dump] CASE '{cn}' type={ct} questions={(qs != null ? qs.Count : 0)}");
+                    if (qs == null) continue;
+                    for (int q = 0; q < qs.Count; q++)
+                    {
+                        var rq = qs[q]; if (rq == null) continue;
+                        string name = "?", it = "?", corr = "", inp = "", inpEv = "";
+                        try { name = rq.name; } catch { }
+                        try { it = rq.inputType.ToString(); } catch { }
+                        try { if (rq.correctAnswers != null) { for (int a = 0; a < rq.correctAnswers.Count; a++) corr += (a > 0 ? "|" : "") + rq.correctAnswers[a]; } } catch { }
+                        try { inp = rq.input; } catch { }
+                        try { inpEv = rq.inputtedEvidence; } catch { }
+                        bool opt = false; try { opt = rq.isOptional; } catch { }
+                        log.LogInfo($"[Narcotics][dump]   q{q}: input={it} opt={opt} name='{name}' correct='{corr}' input='{inp}' inputEv='{inpEv}'");
+                    }
+                }
+            }
+            catch (Exception e) { log.LogWarning($"[Narcotics]  DumpResolveQuestions error: {e.Message}"); }
+        }
+
+        internal static bool TeleportOnto(Human target)
+        {
+            try
+            {
+                var player = Player.Instance;
+                if (player == null || target == null) return false;
+                NewNode node = null; try { node = target.currentNode; } catch { }
+                if (node == null) { try { node = player.FindSafeTeleport(target.currentGameLocation, false, true); } catch { } }
+                if (node == null) return false;
+                // Let the game's own Teleport GROUND the player on the node's floor. We do NOT copy a position onto the
+                // transform afterwards: copying the NPC's transform put the player up on a chair (sitting fall), and
+                // copying node.position sank the player through the floor while the NPC was walking (its currentNode is
+                // briefly a threshold/stair node whose stored position sits below the floor collider). Teleport(node)
+                // handles both postures correctly on its own.
+                player.Teleport(node, null, true, false, true);
+                return true;
+            }
+            catch { return false; }
+        }
+
         internal static void TeleportToNextNPC()
         {
             var log = NarcoticsPlugin.Log;
@@ -261,14 +397,9 @@ namespace Narcotics
                 if (_npcCycle >= npcs.Count) _npcCycle = 0;
                 var h = npcs[_npcCycle];
                 _npcCycle = (_npcCycle + 1) % npcs.Count;
-                var player = Player.Instance;
-                if (player == null || h == null) return;
-                NewNode node = null;
-                try { node = player.FindSafeTeleport(h.currentGameLocation, false, true); } catch { }
-                if (node == null) { try { node = h.currentNode; } catch { } }
-                if (node == null) { log.LogWarning($"[Narcotics]  no safe teleport node near {NarcoticsPlugin.Name(h)}"); return; }
-                player.Teleport(node, null, true, false, true);
-                log.LogInfo($"[Narcotics]  teleported to {Operation.RoleOf(h)} {NarcoticsPlugin.Name(h)}  doses x{Dose.CountIn(h)}");
+                if (h == null) return;
+                if (!TeleportOnto(h)) { log.LogWarning($"[Narcotics]  could not teleport to {NarcoticsPlugin.Name(h)}"); return; }
+                log.LogInfo($"[Narcotics]  teleported onto {Operation.RoleOf(h)} {NarcoticsPlugin.Name(h)}  doses x{Dose.CountIn(h)}");
                 Inspect(h, "teleport");
             }
             catch (Exception e) { log.LogWarning($"[Narcotics]  TeleportToNextNPC error: {e.Message}"); }
@@ -300,13 +431,87 @@ namespace Narcotics
             catch (Exception e) { log.LogWarning($"[Narcotics]  TeleportToNextDrop error: {e.Message}"); }
         }
 
+        // TEST: spawn one drug dose on the ground next to the player, cycling to a DIFFERENT base item each press (so the
+        // photo/card variety can be eyeballed fast), and stamp 1-3 random citizens' fingerprints on it (so dusting can be
+        // checked). Standalone - no operation required; it mints a throwaway drug preset per press.
+        private static int _testDrugCycle;
+        private static readonly System.Random _testRng = new System.Random();
+        internal static void SpawnTestDose()
+        {
+            var log = NarcoticsPlugin.Log;
+            try
+            {
+                var player = Player.Instance;
+                if (player == null) { log.LogWarning("[Narcotics]  SpawnTestDose: no player"); return; }
+                var pool = DrugItem.FindBasePool(false);
+                if (pool == null || pool.Count == 0) { log.LogWarning("[Narcotics]  SpawnTestDose: no drug-item bases found"); return; }
+                var baseP = pool[_testDrugCycle % pool.Count];
+                _testDrugCycle++;
+                string key = "NarcTestDrug_" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+                string name = null; try { name = NarcNames.PickDrug(); } catch { }
+                if (string.IsNullOrEmpty(name)) name = "Test Drug";
+                var drug = DrugItem.CreateDrug(key, name, baseP);
+                if (drug == null) { log.LogWarning("[Narcotics]  SpawnTestDose: drug create failed"); return; }
+                var it = DrugItem.SpawnDoseAtActor(drug, player, null);
+                if (it == null) { log.LogWarning("[Narcotics]  SpawnTestDose: spawn failed (stand inside a room and retry)"); return; }
+                int prints = AddRandomPrints(it, 1 + _testRng.Next(3));
+                log.LogInfo($"[Narcotics]  SpawnTestDose: '{name}' from base '{SafePresetName(baseP)}' ({_testDrugCycle}/{pool.Count}) with {prints} random print(s) - examine/dust the item at your feet.");
+            }
+            catch (Exception e) { log.LogWarning($"[Narcotics]  SpawnTestDose error: {e.Message}"); }
+        }
+
+        // Stamp up to `count` random citizens' fingerprints on an item (persistent manualRemoval prints, so they stay for
+        // dusting). Returns how many were added.
+        private static int AddRandomPrints(Interactable it, int count)
+        {
+            int added = 0;
+            try
+            {
+                if (it == null) return 0;
+                var cd = CityData.Instance; var dir = cd != null ? cd.citizenDirectory : null;
+                if (dir == null || dir.Count == 0) return 0;
+                for (int i = 0; i < count; i++)
+                {
+                    try
+                    {
+                        var h = dir[_testRng.Next(dir.Count)];
+                        if (h == null) continue;
+                        it.AddNewDynamicFingerprint(h, Interactable.PrintLife.manualRemoval);
+                        added++;
+                        NarcoticsPlugin.Log.LogInfo($"[Narcotics]    test print: {NarcoticsPlugin.Name(h)}");
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return added;
+        }
+
         // Dress the active lab with furniture (stand in the lab first for reliable placement).
         internal static void DressLabNow()
         {
             var log = NarcoticsPlugin.Log;
             if (!Operation.Active || Operation.LabLoc == null) { log.LogWarning("[Narcotics]  no active lab to dress"); return; }
-            int n = LabSiting.DressLab(Operation.LabLoc);
+            int n = LabSiting.DressLab(Operation.LabLoc).Count;
             log.LogInfo($"[Narcotics]  DressLab placed {n} cluster(s) (stand in the lab if 0).");
+        }
+
+        // TESTING: spawn one set of lab-equipment clusters into the room the PLAYER is standing in right now (e.g. your
+        // apartment), to check whether furniture-cluster placement works at all in a normal furnished room. If it works
+        // here but not in the vacant lab shell, the shell's missing furniture-placement geometry is the problem.
+        internal static void TestSpawnFurnitureHere()
+        {
+            var log = NarcoticsPlugin.Log;
+            try
+            {
+                var p = Player.Instance; if (p == null) { log.LogWarning("[Narcotics]  no player"); return; }
+                NewNode n = null; try { n = p.currentNode; } catch { }
+                NewRoom room = null; try { room = n != null ? n.room : null; } catch { }
+                if (room == null) { log.LogWarning("[Narcotics]  no current room - stand inside a room and retry"); return; }
+                int placed = LabSiting.DressRoom(room, true).Count;
+                log.LogInfo($"[Narcotics]  TEST furniture spawn: placed {placed} cluster(s) in the room you're standing in. Look around (see [lab] log lines for per-cluster detail).");
+            }
+            catch (Exception e) { log.LogWarning($"[Narcotics]  TestSpawnFurnitureHere error: {e.Message}"); }
         }
 
         // Dump a citizen's identity + operation role + drug inventory to the log panel (fired on talk).
@@ -343,7 +548,7 @@ namespace Narcotics
                         string role = Operation.RoleOf(key);
                         if (role == "-") continue;
                         string flags = "?";
-                        try { var s = ls[key]; if (s != null) flags = $"poi={s.poi} run={s.run} mov={s.mov}"; } catch { }
+                        try { var s = ls[key]; if (s != null) { float now = 0f; try { now = SessionData.Instance.gameTime; } catch { } flags = $"poi={s.poi} run={s.run} mov={s.mov} ageH={(now - s.time):0.00}"; } } catch { }
                         hits.Add($"{role} {NarcoticsPlugin.Name(key)}[{flags}]");
                     }
                 }
@@ -388,8 +593,11 @@ namespace Narcotics
         {
             try
             {
+                Operation.TickAutoStart();   // proactive auto-start when HijackChance=1.0 (doesn't wait for a vanilla case)
+                Operation.TickPendingStrip();   // finish a deferred lab-furniture strip once the old lab is back in view; cheap no-op otherwise
                 Operation.Tick();   // real operation logic (cook pin re-assert); cheap no-op when inactive
                 Arrest.Tick();      // drives a staged arrest test; cheap no-op when inactive
+                NarcCase.TickVerdict();   // after submit + the processing delay, run the one Case.Resolve() (the verdict)
                 Diagnostics.TickBannerRestore();   // restore vanilla banner text after our override window
                 if (!NarcoticsConfig.EnableDebugKeys) return;
                 if (Input.GetKeyDown(NarcoticsConfig.KeyCityHall)) Diagnostics.TeleportToCityHall();
@@ -409,6 +617,10 @@ namespace Narcotics
                 FastForward.Apply();
                 if (Input.GetKeyDown(NarcoticsConfig.KeyTeleportNPC)) Diagnostics.TeleportToNextNPC();
                 if (Input.GetKeyDown(NarcoticsConfig.KeyDropTeleport)) Diagnostics.TeleportToNextDrop();
+                if (Input.GetKeyDown(NarcoticsConfig.KeyUnlockComputer)) Diagnostics.UnlockActiveComputer();
+                if (Input.GetKeyDown(NarcoticsConfig.KeySpawnFurniture)) Diagnostics.TestSpawnFurnitureHere();
+                if (Input.GetKeyDown(NarcoticsConfig.KeyDumpResolve)) Diagnostics.DumpResolveQuestions();
+                if (Input.GetKeyDown(NarcoticsConfig.KeySpawnTestDose)) Diagnostics.SpawnTestDose();
             }
             catch (Exception e) { NarcoticsPlugin.Log.LogWarning($"[Narcotics] hotkey update error: {e.Message}"); }
         }
@@ -440,8 +652,9 @@ namespace Narcotics
                         GUI.Label(new Rect(18f, 14f + lineH * (i + 1.4f), w - 20f, lineH), lines[i], _panelStyle);
                 }
 
-                // Right: live operation roster (cook + every tier + their physical dose counts).
-                if (Operation.Active)
+                // Right: live operation roster (cook + every tier + their physical dose counts). Toggles WITH the F9 log
+                // panel (LogPanel.Show) so both appear/hide together.
+                if (LogPanel.Show && Operation.Active)
                 {
                     var rl = Operation.RosterLines();
                     float rlineH = 20f, rw = 460f, rx = UnityEngine.Screen.width - rw - 8f;
@@ -502,6 +715,93 @@ namespace Narcotics
         }
     }
 
+    // Drug item NAME safety net. With the clone's retail link nulled (DrugItem.CreateDrug), the dose's name resolves
+    // through evidence.names[presetName] (what we write = the case's drug name), cached per-dose and consistent between
+    // the hover tooltip and the examine panel. This postfix only steps in if that resolution comes back BROKEN - empty,
+    // the generic "retail item", or the raw preset key - and fills the current operation's drug name. A good per-dose
+    // name is left untouched, so a dose keeps ITS case's drug name (no live-override mismatch across cases).
+    [HarmonyLib.HarmonyPatch(typeof(Interactable), nameof(Interactable.GetName))]
+    internal static class Patch_DrugItemName
+    {
+        static void Postfix(Interactable __instance, ref string __result)
+        {
+            try
+            {
+                if (__instance == null) return;
+                InteractablePreset p = null; try { p = __instance.preset; } catch { }
+                if (p == null || !DrugItem.IsOurDrugPreset(p)) return;   // one of OUR drug clones?
+                string nm = DrugItem.NameFor(p);   // that clone's own drug name
+                if (!string.IsNullOrEmpty(nm) && __result != nm) __result = nm;   // force it on every GetName surface (hover tooltip / world name)
+            }
+            catch { }
+        }
+    }
+
+    // Drug dose DESCRIPTION override. The examine card's writeup (the blurb under the item photo, on the SUMMARY view)
+    // is the evidence SUMMARY. For a retail-item base (beta blockers etc.) the dose's evidence is EvidenceRetailItem,
+    // which OVERRIDES GetSummary; a non-retail base uses the base Evidence.GetSummary. We postfix BOTH and substitute our
+    // text ("A mysterious new substance") for OUR dose only - scoped by the evidence's interactablePreset matching the
+    // current drug clone - so real beta blockers (same shared EvidencePreset) are untouched. This replaced the earlier
+    // broken routes: Interactable.SetDDSOverride turned the dose into a readable DOCUMENT (big crumpled page, "Retail
+    // Item" title), and cloning/repointing the EvidencePreset.ddsDocumentID blanked the whole card.
+    internal static class DrugDesc
+    {
+        internal static bool IsOurDose(Evidence ev)
+        {
+            try { InteractablePreset p = ev != null ? ev.interactablePreset : null; return DrugItem.IsOurDrugPreset(p); }
+            catch { return false; }
+        }
+
+        // The display name for THIS dose's drug (each of our presets carries its own), so several different drugs can be
+        // on screen at once (the test-spawn key) and each shows its own name.
+        internal static string NameFor(Evidence ev)
+        {
+            try { InteractablePreset p = ev != null ? ev.interactablePreset : null; return DrugItem.NameFor(p); }
+            catch { return null; }
+        }
+    }
+
+    // Drug dose NAME on the examine-window TITLE. For a retail base the window title is the EVIDENCE name produced by
+    // EvidenceRetailItem.GenerateName (the generic "Retail Item" discovery name) - NOT Interactable.GetName - so the
+    // GetName patch (which fixes the hover tooltip) never reaches the window title. Override GenerateName for OUR dose to
+    // the case's drug name; base Evidence.GenerateName covers any non-retail future base. Scoped by interactablePreset so
+    // real retail items are untouched.
+    [HarmonyLib.HarmonyPatch(typeof(EvidenceRetailItem), nameof(EvidenceRetailItem.GenerateName))]
+    internal static class Patch_DrugItemEvName
+    {
+        static void Postfix(EvidenceRetailItem __instance, ref string __result)
+        {
+            try { var nm = DrugDesc.NameFor(__instance); if (!string.IsNullOrEmpty(nm)) __result = nm; } catch { }
+        }
+    }
+
+    [HarmonyLib.HarmonyPatch(typeof(Evidence), nameof(Evidence.GenerateName))]
+    internal static class Patch_DrugItemEvName_Base
+    {
+        static void Postfix(Evidence __instance, ref string __result)
+        {
+            try { var nm = DrugDesc.NameFor(__instance); if (!string.IsNullOrEmpty(nm)) __result = nm; } catch { }
+        }
+    }
+
+    [HarmonyLib.HarmonyPatch(typeof(EvidenceRetailItem), nameof(EvidenceRetailItem.GetSummary))]
+    internal static class Patch_DrugItemDescription
+    {
+        static void Postfix(EvidenceRetailItem __instance, ref string __result)
+        {
+            try { if (DrugDesc.IsOurDose(__instance)) __result = DrugItem.DrugDescription; } catch { }
+        }
+    }
+
+    [HarmonyLib.HarmonyPatch(typeof(Evidence), nameof(Evidence.GetSummary))]
+    internal static class Patch_DrugItemDescription_Base
+    {
+        static void Postfix(Evidence __instance, ref string __result)
+        {
+            try { if (DrugDesc.IsOurDose(__instance)) __result = DrugItem.DrugDescription; } catch { }
+        }
+    }
+
     // Talk-to-inspect: when the player opens a dialog with a citizen, dump their identity + role + drug inventory
     // to the log panel, so drug transfers can be verified by talking to NPCs. Behind EnableDebugKeys.
     [HarmonyLib.HarmonyPatch(typeof(InteractionController), nameof(InteractionController.SetDialog))]
@@ -534,10 +834,10 @@ namespace Narcotics
                 if (actor == null) return;
                 var h = actor.TryCast<Human>();
                 if (h == null) return;
-                if (Arrest.Active && Arrest.Subject != null && h.humanID == Arrest.Subject.humanID) Arrest.NotifySearched();
-                // Searching (frisking) the case's suspect is the ONLY thing that clears the 'search the suspect' lead
-                // (works even after the hold ends, as long as the case is open).
-                try { if (NarcCase.IsOpen && NarcCase.SubjectId != -1 && h.humanID == NarcCase.SubjectId) NarcCase.ClearLead("search"); } catch { }
+                Arrest.NotifySearched(h);   // matches the searched human against the active + all posted arrestees
+                // Frisking an arrested buyer clears THAT buyer's search lead (keyed by humanID, so each overdose's lead
+                // is independent - searching one never clears another's). Works even after the hold ends while the case is open.
+                try { if (NarcCase.IsOpen && NarcCase.HasLead(h.humanID)) NarcCase.ClearLeadFor(h.humanID, "search"); } catch { }
             }
             catch { }
         }
@@ -696,20 +996,51 @@ namespace Narcotics
         }
     }
 
-    // Safety net: if any path calls Case.Resolve() on our synthetic case, its caseType routing would (for a murder)
-    // deref murder state we lack. We do NOT call Resolve() on the submit path (submit is just SetStatus(submitted)),
-    // so this is normally inert, but it guards against any engine path that does. Swallows ONLY for our case (by
-    // pointer); real cases' exceptions propagate.
+    // Decode (2026-10-04): NO engine code resolves a custom case (zero symbol-callers of Case.Resolve; SetStatus and
+    // the case-processing objective schedule none), so the mod drives the ONE Resolve itself (TickVerdict, flagged
+    // _resolvingSelf). The reported double reveal+banner is therefore a SECOND Resolve() landing on the SAME case:
+    //   (a) while it is our active case but not our call -> block by Current.Pointer + !ResolvingSelf;
+    //   (b) AFTER it solved and tear-down nulled Current -> block by the ResolvedPtrs latch (survives Current==null,
+    //       which is exactly where the old Current-only guard let the second banner through).
+    // A FAILED case is never latched (it reopens for a retry and must stay re-resolvable). The Finalizer absorbs any
+    // residual NPE for our case (real cases' exceptions propagate).
     [HarmonyLib.HarmonyPatch(typeof(Case), nameof(Case.Resolve))]
     internal static class Patch_CaseResolve
     {
+        static bool Prefix(Case __instance)
+        {
+            try
+            {
+                if (__instance == null) return true;
+                var ptr = __instance.Pointer;
+                if (NarcCase.ResolvedPtrs.Contains(ptr))   // (b) already solved -> never replay the sequence
+                {
+                    NarcoticsPlugin.Log.LogInfo("[Narcotics][case] swallowed a re-Resolve of an already-solved case (double-banner guard).");
+                    // Debug: capture WHO fired the second Resolve, so we can root-cause (band-aid -> known cause).
+                    if (NarcoticsConfig.EnableDebugKeys)
+                    {
+                        try { NarcoticsPlugin.Log.LogInfo("[Narcotics][case][resolve-caller]\n" + new System.Diagnostics.StackTrace(1, false)); } catch { }
+                    }
+                    return false;
+                }
+                var cur = NarcCase.Current;
+                if (cur != null && ptr == cur.Pointer && !NarcCase.ResolvingSelf)   // (a) our case, not our call
+                {
+                    NarcoticsPlugin.Log.LogInfo("[Narcotics][case] swallowed a non-mod Case.Resolve (we drive the verdict ourselves).");
+                    return false;
+                }
+            }
+            catch { }
+            return true;
+        }
         static Exception Finalizer(Case __instance, Exception __exception)
         {
             try
             {
-                if (__exception == null) return null;
+                if (__exception == null || __instance == null) return __exception;
+                var ptr = __instance.Pointer;
                 var cur = NarcCase.Current;
-                if (cur != null && __instance != null && __instance.Pointer == cur.Pointer)
+                if (NarcCase.ResolvedPtrs.Contains(ptr) || (cur != null && ptr == cur.Pointer))
                 {
                     NarcoticsPlugin.Log.LogInfo("[Narcotics][case] absorbed Case.Resolve NPE (synthetic case, no backing murder).");
                     return null;   // swallow for our case
@@ -751,6 +1082,24 @@ namespace Narcotics
         {
             if (__exception != null && NarcCase.IsActiveOnPanel()) { NarcoticsPlugin.Log.LogInfo($"[Narcotics][case] absorbed InputFieldController.Setup: {__exception.GetType().Name}: {__exception.Message}"); return null; }
             return __exception;
+        }
+    }
+
+    // The engine re-evaluates a resolve question (UpdateCorrect) whenever the player SELECTS/changes an answer. We ride
+    // that event to re-grade our arrest + location rows (the engine's own murder-linked checks don't fire for a custom
+    // case), so the arrest checkmark ticks the moment the player names the cook (and the cook is in custody) - exactly
+    // when vanilla's does - without us polling every frame.
+    [HarmonyLib.HarmonyPatch(typeof(Case.ResolveQuestion), nameof(Case.ResolveQuestion.UpdateCorrect))]
+    internal static class Patch_ResolveUpdateCorrect
+    {
+        static void Postfix(Case forCase)
+        {
+            try
+            {
+                var cur = NarcCase.Current;
+                if (cur != null && forCase != null && forCase.Pointer == cur.Pointer) NarcCase.GradeSpecialQuestions(false);
+            }
+            catch { }
         }
     }
 

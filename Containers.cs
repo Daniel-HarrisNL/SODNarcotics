@@ -44,7 +44,9 @@ namespace Narcotics
             return Vector3.zero;
         }
 
-        // The N nearest usable containers to the lab building exterior, preferring OUTSIDE ones (street bins).
+        // A pool of usable containers near the lab building exterior, NEAREST FIRST. Prefers OUTSIDE street bins
+        // (the design's dead drops); only if there are none does it fall back to any container near the lab, so the
+        // caller always has a real searchable bin. The caller then picks the nearest one that a CCTV camera films.
         internal static List<FurnitureLocation> SiteContainersNearLab(NewAddress lab, int n)
         {
             var result = new List<FurnitureLocation>();
@@ -61,17 +63,18 @@ namespace Narcotics
                 var seen = new HashSet<IntPtr>();
                 for (int i = 0; i < locs.Count; i++) CollectContainers(locs[i], anchor, found, seen);
 
-                // Keep ONLY outside containers: the big street trash containers/dumpsters the design wants. This
-                // excludes interior furniture AND small indoor trash cans (the throwable ones are items, not
-                // furniture, so they never appear here anyway). Prefer dumpster-type names, then nearest.
+                // Prefer OUTSIDE containers (street bins/dumpsters); fall back to ANY container near the lab only when
+                // there are no outside ones, so the supply chain always has a real searchable bin. Sort NEAREST FIRST
+                // (the caller wants the closest bin to the lab, then prefers one on camera).
                 var outside = new List<Cand>();
                 for (int i = 0; i < found.Count; i++) if (found[i].Outside) outside.Add(found[i]);
-                outside.Sort((a, b) => { bool ad = IsBigBinName(a.Name), bd = IsBigBinName(b.Name); if (ad != bd) return ad ? -1 : 1; return a.Dist.CompareTo(b.Dist); });
-                for (int i = 0; i < outside.Count && result.Count < n; i++) result.Add(outside[i].Fl);
+                var pool = outside.Count > 0 ? outside : found;
+                pool.Sort((a, b) => a.Dist.CompareTo(b.Dist));
+                for (int i = 0; i < pool.Count && result.Count < n; i++) result.Add(pool[i].Fl);
 
-                Log($"sited {result.Count}/{n} OUTSIDE container(s) near the lab ({outside.Count} outside / {found.Count} total, {locs.Count} location(s) scanned).");
-                for (int i = 0; i < outside.Count && i < 10; i++) { var c = outside[i]; Log($"  cand: '{c.Name}' subs={c.Subs} {c.Dist:0}m{(i < result.Count ? "  <= PICKED" : "")}"); }
-                if (result.Count < n) DumpNearbyFurniture(locs, anchor);
+                Log($"sited {result.Count}/{n} container(s) near the lab ({outside.Count} outside / {found.Count} total, {locs.Count} location(s) scanned; using {(outside.Count > 0 ? "outside" : "any")}).");
+                for (int i = 0; i < pool.Count && i < 12; i++) { var c = pool[i]; Log($"  cand: '{c.Name}' outside={c.Outside} subs={c.Subs} {c.Dist:0}m{(i < result.Count ? "  <= in pool" : "")}"); }
+                if (result.Count == 0) DumpNearbyFurniture(locs, anchor);
             }
             catch (Exception e) { Log($"SiteContainersNearLab error: {e.Message}"); }
             return result;
@@ -127,6 +130,25 @@ namespace Narcotics
             catch { }
         }
 
+        // A real TRASH BIN by name (dumpster/skip/bin/trash/garbage/waste/recycling) - what the dead-drop design wants.
+        // Excludes 'poster' (the broad 'post' keyword used to catch it) and 'cabinet' (which contains the substring
+        // "bin"), so only genuine street trash containers qualify. The caller still validates with Dose.CanDeposit.
+        internal static bool IsTrashBin(FurnitureLocation fl)
+        {
+            try
+            {
+                string nm = fl != null && fl.furniture != null ? fl.furniture.name : null;
+                if (string.IsNullOrEmpty(nm)) return false;
+                var l = nm.ToLowerInvariant();
+                if (l.Contains("poster")) return false;
+                if (l.Contains("dumpster") || l.Contains("skip") || l.Contains("recycl")
+                 || l.Contains("trash") || l.Contains("garbage") || l.Contains("waste")) return true;
+                if (l.Contains("bin") && !l.Contains("cabinet")) return true;
+            }
+            catch { }
+            return false;
+        }
+
         // A container = a bin/mailbox/locker by NAME (accepted even with no sub-object slot - public bins use the
         // trash system, not a slot), OR storage-class furniture (mailboxes/locker/drawers/safe) that has a slot.
         internal static bool IsContainer(FurnitureLocation fl)
@@ -140,8 +162,9 @@ namespace Narcotics
                 if (!string.IsNullOrEmpty(nm))
                 {
                     var low = nm.ToLowerInvariant();
-                    if (low.Contains("bin") || low.Contains("trash") || low.Contains("waste") || low.Contains("garbage")
-                     || low.Contains("recycl") || low.Contains("dumpster") || low.Contains("mail") || low.Contains("post")
+                    if (low.Contains("poster")) { /* decorative, not a container - fall through to slot check */ }
+                    else if (low.Contains("bin") || low.Contains("trash") || low.Contains("waste") || low.Contains("garbage")
+                     || low.Contains("recycl") || low.Contains("dumpster") || low.Contains("mail") || low.Contains("postbox") || low.Contains("post box")
                      || low.Contains("locker") || low.Contains("cabinet") || low.Contains("drawer")) return true;
                 }
 
@@ -268,14 +291,6 @@ namespace Narcotics
             try { return Vector3.Distance(anchor, fl.GetWorldAveragePosition()); } catch { }
             try { var an = fl.anchorNode; if (an != null) return Vector3.Distance(anchor, an.position); } catch { }
             return float.MaxValue;
-        }
-
-        // Prefer the big street trash containers (dumpsters/skips/recycling) over any other outside furniture.
-        private static bool IsBigBinName(string nm)
-        {
-            if (string.IsNullOrEmpty(nm)) return false;
-            var l = nm.ToLowerInvariant();
-            return l.Contains("dumpster") || l.Contains("skip") || l.Contains("recycl") || l.Contains("container") || l.Contains("trash") || l.Contains("bin");
         }
 
         private static bool Alive(Human h) { if (h == null) return false; try { return !h.isDead; } catch { return true; } }

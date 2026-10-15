@@ -62,10 +62,20 @@ namespace Narcotics
                 if (it == null) return null;
 
                 try { it.SetInInventory(holder); } catch (Exception e) { Log($"SetInInventory threw: {e.Message}"); }
+                try { it.AddNewDynamicFingerprint(holder, Interactable.PrintLife.timed); } catch { }   // guarantee the holder's print (the forensic trail), not only SetInInventory's stamp
+                ClearOwner(it);   // no owner -> taking it (during a search) isn't theft, so bystanders don't attack
                 Track(holder, it);
                 return it;
             }
             catch (Exception e) { Log($"Create error: {e.Message}"); return null; }
+        }
+
+        // Clear the dose's OWNER (belongsTo) so the player taking it during a search is NOT treated as theft -> no
+        // bystander-attack. The forensic link is the FINGERPRINT (still stamped) and searchability is the Evidence +
+        // inInventory, both independent of belongsTo. (Decoded: GetValidPlayerActionIllegal keys theft off belongsTo.)
+        private static void ClearOwner(Interactable it)
+        {
+            try { if (it != null) it.belongsTo = null; } catch { }
         }
 
         // Place a physical dose into a game location's furniture (a persistent, searchable STASH - e.g. inside the
@@ -84,6 +94,7 @@ namespace Narcotics
                     forcedOwnership: InteractablePreset.OwnedPlacementRule.both, forcedPriority: 5,
                     placeClosestTo: near, ignoreLimits: true);
                 if (it != null && owner != null) { try { it.AddNewDynamicFingerprint(owner, Interactable.PrintLife.timed); } catch { } }
+                ClearOwner(it);   // keep the fingerprint (above) but drop ownership so taking it isn't theft
                 return it;
             }
             catch (Exception e) { Log($"Place error: {e.Message}"); return null; }
@@ -120,6 +131,14 @@ namespace Narcotics
             }
             catch (Exception e) { Log($"FindBinPage error: {e.Message}"); }
             return null;
+        }
+
+        // True if this furniture is a REAL searchable container (has a container EvidenceMultiPage the player's search
+        // reads). Use to validate a dead-drop candidate at siting time so we never pick something that can't hold doses
+        // (e.g. a decorative item whose name happens to match a bin keyword).
+        internal static bool CanDeposit(FurnitureLocation fl)
+        {
+            try { return FindBinPage(fl) != null; } catch { return false; }
         }
 
         // Deposit one dose as searchable trash into the bin (a contained MetaObject on its page), carrying the
@@ -238,6 +257,7 @@ namespace Narcotics
             {
                 if (to == null || !Alive(it)) return false;
                 try { it.SetInInventory(to); } catch (Exception e) { Log($"Pickup SetInInventory threw: {e.Message}"); return false; }
+                ClearOwner(it);   // in case SetInInventory re-stamped ownership; keep it un-owned (not theft to take)
                 bool ok = false; try { var inv = it.inInventory; ok = inv != null && inv.humanID == to.humanID; } catch { }
                 if (ok) Track(to, it);
                 return ok;
@@ -268,6 +288,7 @@ namespace Narcotics
                 var it = TakeHandle(from);
                 if (it == null) return false;
                 try { it.SetInInventory(to); } catch (Exception e) { Log($"Transfer SetInInventory threw: {e.Message}"); }
+                ClearOwner(it);   // the buyer holds it but doesn't OWN it -> searching them + taking it isn't theft
                 Track(to, it);
                 return true;
             }

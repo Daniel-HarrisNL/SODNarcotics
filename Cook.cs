@@ -44,7 +44,9 @@ namespace Narcotics
                 if (recreate)
                 {
                     RemoveAllSiteGoals(ai, lab);
-                    AIGoalPreset preset = null; try { var rc = RoutineControls.Instance; if (rc != null) preset = rc.toGoGoal; } catch { }
+                    // WALK to the lab, don't run: toGoGoal forces running (looked unnatural). Fall back to it only
+                    // if the walk goal is missing, so the cook still gets pinned.
+                    AIGoalPreset preset = null; try { var rc = RoutineControls.Instance; if (rc != null) { preset = rc.toGoWalkGoal; if (preset == null) preset = rc.toGoGoal; } } catch { }
                     if (preset == null) return;
                     NewAIGoal ng = null;
                     try { ng = ai.CreateNewGoal(preset, NowHours(), 9999f, node, null, lab, null, null, -2); }
@@ -119,7 +121,9 @@ namespace Narcotics
                 if (goal == null || !sameNode)
                 {
                     if (_herdGoalPtr != IntPtr.Zero) { RemoveGoalByPtr(ai, _herdGoalPtr); _herdGoalPtr = IntPtr.Zero; }
-                    AIGoalPreset preset = null; try { var rc = RoutineControls.Instance; if (rc != null) preset = rc.toGoGoal; } catch { }
+                    // WALK toward the dealer, don't run (toGoGoal forces running). Fall back to the run goal only if
+                    // the walk goal is unavailable.
+                    AIGoalPreset preset = null; try { var rc = RoutineControls.Instance; if (rc != null) { preset = rc.toGoWalkGoal; if (preset == null) preset = rc.toGoGoal; } } catch { }
                     if (preset == null) return false;
                     NewGameLocation loc = null; try { loc = target.currentGameLocation; } catch { }
                     NewAIGoal ng = null;

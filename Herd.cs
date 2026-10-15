@@ -58,13 +58,68 @@ namespace Narcotics
             catch (Exception e) { Log($"ToActor error: {e.Message}"); return false; }
         }
 
+        // SOFT drive toward a fixed node: assigns a top-priority goal ONCE and then leaves it alone (does NOT re-slam
+        // currentGoal / priority every tick like the hard pin does). The AI still walks there (priority 100000 wins the
+        // goal sort), but because we don't clobber currentGoal each frame, the vanilla "being followed" reaction - which
+        // inserts a spook/confront action into currentGoal - can attach and run while the NPC is in transit. Use this
+        // for travel where we want reactions; use ToNode (hard) where the NPC must be rigidly held. Returns true within rangeM.
+        internal static bool ToNodeSoft(Human mover, NewNode node, NewGameLocation loc, float rangeM, AIGoalPreset preset = null)
+        {
+            try
+            {
+                if (mover == null || node == null) return false;
+                AssertSoft(mover, node, loc, preset);
+                return Near(mover, node, rangeM);
+            }
+            catch (Exception e) { Log($"ToNodeSoft error: {e.Message}"); return false; }
+        }
+
+        // Create the goal if missing (or the node/preset changed) and kick it off ONCE; otherwise leave it untouched so
+        // the AI can interrupt it with a reaction and then re-elect it (its priority stays 100000 in the goal list).
+        private static void AssertSoft(Human mover, NewNode node, NewGameLocation loc, AIGoalPreset preset)
+        {
+            NewAIController ai = null; try { ai = mover.ai; } catch { }
+            if (ai == null) return;
+            if (preset == null) { try { var rc = RoutineControls.Instance; if (rc != null) { preset = rc.toGoWalkGoal; if (preset == null) preset = rc.toGoGoal; } } catch { } }
+            if (preset == null) return;
+            IntPtr presetPtr = IntPtr.Zero; try { presetPtr = preset.Pointer; } catch { }
+
+            int id; try { id = mover.humanID; } catch { return; }
+            if (!_pins.TryGetValue(id, out var pin) || pin == null) { pin = new Pin(); _pins[id] = pin; }
+
+            NewAIGoal goal = FindGoalByPtr(ai, pin.GoalPtr);
+            bool sameNode = false; try { sameNode = pin.NodePtr != IntPtr.Zero && node.Pointer == pin.NodePtr; } catch { }
+            bool samePreset = presetPtr != IntPtr.Zero && presetPtr == pin.PresetPtr;
+            if (goal == null || !sameNode || !samePreset)
+            {
+                if (pin.GoalPtr != IntPtr.Zero) { RemoveGoalByPtr(ai, pin.GoalPtr); pin.GoalPtr = IntPtr.Zero; }
+                NewAIGoal ng = null;
+                try { ng = ai.CreateNewGoal(preset, NowHours(), 9999f, node, null, loc, null, null, -2); }
+                catch (Exception e) { Log($"AssertSoft CreateNewGoal threw: {e.Message}"); return; }
+                if (ng == null) return;
+                goal = ng;
+                try { pin.NodePtr = node.Pointer; } catch { }
+                try { pin.PresetPtr = presetPtr; } catch { }
+                try { pin.GoalPtr = goal.Pointer; } catch { }
+                try { goal.basePriority = 100000f; } catch { }
+                try { goal.priority = 100000f; } catch { }
+                try { goal.isActive = true; } catch { }
+                try { ai.currentGoal = goal; } catch { }   // kick off the walk ONCE; do NOT re-slam each tick
+            }
+            // else: goal already present for this node/preset -> leave it (no re-slam) so a vanilla reaction can take over.
+        }
+
         // Re-assert (or create) the max-priority goal for `mover` toward `node`, using `preset` (default = toGoGoal).
         private static void Assert(Human mover, NewNode node, NewGameLocation loc, AIGoalPreset preset)
         {
             NewAIController ai = null; try { ai = mover.ai; } catch { }
             if (ai == null) return;
 
-            if (preset == null) { try { var rc = RoutineControls.Instance; if (rc != null) preset = rc.toGoGoal; } catch { } }
+            // Default to the WALK-to goal, not toGoGoal: toGoGoal's move action forces RUNNING, which made every
+            // herded NPC (cook, distributor, dealer, buyer, pinned arrest subject) sprint around unnaturally. The
+            // arrest enforcer passes its own urgent response goal explicitly, so it is unaffected. Fall back to the
+            // running goal only if the walk goal is unavailable, so movement never stalls.
+            if (preset == null) { try { var rc = RoutineControls.Instance; if (rc != null) { preset = rc.toGoWalkGoal; if (preset == null) preset = rc.toGoGoal; } } catch { } }
             if (preset == null) return;
             IntPtr presetPtr = IntPtr.Zero; try { presetPtr = preset.Pointer; } catch { }
 
@@ -119,6 +174,27 @@ namespace Narcotics
         internal static bool IsPinned(Human mover)
         {
             try { return mover != null && _pins.ContainsKey(mover.humanID); } catch { return false; }
+        }
+
+        // True when `mover` is actively reacting to something (tail/confront/flee/investigate). The vanilla reaction
+        // inserts a spook/confront action into the NPC's currentGoal and sets reactionState/spooked; our priority-100000
+        // pin FIGHTS that (re-slamming currentGoal), which traps the NPC in a flailing "under attack" loop. Callers use
+        // this to RELEASE the pin and get out of the way until the NPC calms. reactionState is the transient state
+        // machine (none when calm); spooked is a decaying fear timer (spookForgetCounter clears it).
+        // We key on reactionState ONLY: it is the AI's transient reaction state machine (none = calm; the tail
+        // confront/pursuit shows up as investigatingSight/persuing/searching), so it reliably clears when the player
+        // stops tailing. We deliberately do NOT also gate on the `spooked` float - its decay semantics are unverified,
+        // and if it ever held a nonzero baseline the dealer would never deal or collect. reactionState is enough to
+        // stop the pin fighting the reaction (the actual bug); a benign distraction just defers a deal, which is fine.
+        internal static bool IsReacting(Human mover)
+        {
+            try
+            {
+                var ai = mover != null ? mover.ai : null;
+                if (ai == null) return false;
+                return ai.reactionState != NewAIController.ReactionState.none;
+            }
+            catch { return false; }
         }
 
         private static bool Near(Human mover, NewNode node, float rangeM)

@@ -17,15 +17,42 @@ namespace Narcotics
     {
         internal static Case Current;
         internal static int SubjectId = -1;   // humanID of the most recent arrested buyer tied to this case
-        internal static string LeadText;   // the exact "Search <name> at <loc>" lead text, so we can find + clear it on search
+        // Active "Search <name>" leads keyed by the arrested buyer's humanID, so each arrest has its OWN lead and
+        // searching one buyer clears only THAT lead. Lets multiple overdoses accumulate independent search leads on the
+        // one case (serial style) instead of collapsing into a single shared "Search" lead.
+        private static readonly System.Collections.Generic.Dictionary<int, string> _leads = new System.Collections.Generic.Dictionary<int, string>();
+        internal static bool HasLead(int humanID) { try { return _leads.ContainsKey(humanID); } catch { return false; } }
+
+        // The resolve-question labels. ResolveQuestion.GetText looks `name` up as a missions.postings KEY, so we
+        // register these verbatim as self-resolving keys (RegisterStrings) - that makes the form rows, the objectives,
+        // AND the verdict reveal all show the text, instead of blank.
+        internal const string QProducing = "Who is producing the drug?";
+        internal const string QLabLocation = "Where is the drug lab?";
+        internal const string QCookArrested = "Has the cook been arrested?";
+        internal const string QTransporting = "Who is transporting the drug from the lab?";
+        internal const string QDealing = "Who is dealing the drug?";
+
+        private static bool _pendingVerdict;   // submit -> short processing wait -> Case.Resolve() runs the verdict
+        private static float _pendingVerdictAt;
+        private const float ProcessingDelaySec = 5f;
+        private static bool _resolvingSelf;    // true only inside OUR TickVerdict Resolve call
+        internal static bool ResolvingSelf { get { return _resolvingSelf; } }   // Patch_CaseResolve swallows any Resolve that isn't ours
+        private const int SolveSocialCredit = 500;   // social-credit bump on a solved case (Resolve only grants money, never social credit for custom)
+        // Pointers of cases we have already SOLVED. The decode proved the double reveal+banner is a SECOND Case.Resolve()
+        // on an already-resolved case; the old Current-pointer guard misses it once Current is nulled by tear-down. This
+        // latch survives tear-down: any Resolve on a latched pointer is swallowed (Patch_CaseResolve). Only solved cases
+        // are latched - a FAILED case reopens to handInCollected and must stay re-resolvable for the retry.
+        internal static readonly System.Collections.Generic.HashSet<System.IntPtr> ResolvedPtrs = new System.Collections.Generic.HashSet<System.IntPtr>();
 
         internal static bool IsOpen
         {
             get { try { return Current != null && Current.Pointer != IntPtr.Zero; } catch { return false; } }
         }
 
-        // The player has submitted / closed / archived the case via the vanilla resolution loop. Used to release
-        // the cuffed buyer early. Returns false when there is simply no case (so the arrest's hold-timer governs).
+        // The case has actually been RESOLVED (verdict ran, solved). Used to release the cuffed buyer + stand the
+        // operation down. NOT merely "submitted": a submitted case is still mid-processing (the verdict - Case.Resolve
+        // - runs a few seconds later and may come back UNSOLVED, which must NOT count as solved or we'd end the case
+        // on a failed attempt). So we rely on the real isSolved flag + the closable/archived end states.
         internal static bool IsSolved()
         {
             try
@@ -35,7 +62,7 @@ namespace Narcotics
                 try
                 {
                     var st = Current.caseStatus;
-                    if (st == Case.CaseStatus.submitted || st == Case.CaseStatus.closable || st == Case.CaseStatus.archived)
+                    if (st == Case.CaseStatus.closable || st == Case.CaseStatus.archived)
                         return true;
                 }
                 catch { }
@@ -76,14 +103,17 @@ namespace Narcotics
                 // murder in that window. Custom avoids the gate entirely (and has no murder-resolve path to NPE). We
                 // drive objective text (Patch_ObjectiveSetup), the resolve-question rendering (Patch_InputFieldSetup),
                 // and the hand-in ourselves.
-                Case c = new Case("New Drug on the Street", Case.CaseType.custom, Case.CaseStatus.handInNotCollected);
+                string caseTitle = "New Drug on the Street"; try { if (!string.IsNullOrEmpty(Operation.CaseTitle)) caseTitle = Operation.CaseTitle; } catch { }
+                Case c = new Case(caseTitle, Case.CaseType.custom, Case.CaseStatus.handInNotCollected);
                 bool present = false; try { present = cpc.activeCases != null && cpc.activeCases.Contains(c); } catch { }
                 if (!present) { try { cpc.activeCases.Add(c); } catch (Exception e) { Log($"activeCases.Add failed: {e.Message}"); } }
                 try { cpc.SetActiveCase(c); } catch (Exception e) { Log($"SetActiveCase failed: {e.Message}"); }
                 try { cpc.UpdateCaseButtonsActive(); } catch { }
                 try { cpc.UpdateCaseControls(); } catch { }
 
-                Current = c; SubjectId = sid;
+                Current = c; SubjectId = sid; _pendingVerdict = false; _resolvingSelf = false;
+                try { ResolvedPtrs.Clear(); } catch { }   // fresh case: drop any stale solved-pointer latch
+                try { _leads.Clear(); } catch { }         // fresh case: drop any stale search leads
 
                 // CaseType.custom never auto-resolves objective text and SetStatus never adds the hand-in machinery
                 // for it, so we drive the whole case ourselves:
@@ -119,14 +149,42 @@ namespace Narcotics
             catch (Exception e) { Log($"Open error: {e}"); return false; }
         }
 
+        // The arrest hook (called when an overdosed buyer is restrained). FIRST arrest opens the case (Open adds its
+        // own "search the suspect" lead). Each LATER arrest - there is only ever one cook/drug at a time, so it is
+        // always the SAME case - adds ANOTHER "Search <buyer>" objective to that case + a scanner blip, with NO new
+        // case and NO banner. This mirrors how vanilla serial killers work (verified 2026-10-04): the game keeps one
+        // currentActiveCase and surfaces each new victim as another objective via Case.AddObjective, never a 2nd case.
+        internal static bool OnSubjectArrested(Human subject)
+        {
+            try
+            {
+                if (!IsOpen) return Open(subject);   // first arrest: opens the case + adds the first search lead
+
+                if (subject != null) { try { SubjectId = subject.humanID; } catch { } }
+                AddInvestigateObjective(Current, subject);   // another "Search <buyer> at <loc>" lead on the same case
+                try { Current.ValidationCheck(); } catch { }
+                try { var cpc = CasePanelController.Instance; if (cpc != null) { cpc.SetActiveCase(Current); cpc.UpdateCaseButtonsActive(); cpc.UpdateCaseControls(); } } catch { }
+                string nm = CleanName(subject);
+                Scanner("[Scanner] Reported Possession - search " + nm);
+                Log($"ADDITIONAL ARREST: {nm} (#{(subject != null ? subject.humanID : -1)}) folds into the open case '{SafeName(Current)}' as a new search lead (no new case, serial-style).");
+                return false;
+            }
+            catch (Exception e) { Log($"OnSubjectArrested error: {e.Message}"); return false; }
+        }
+
         // The bottom-left police-scanner feed blip (the per-event notification; distinct from the big banner).
-        internal static void Scanner(string message, InterfaceControls.Icon icon = InterfaceControls.Icon.handcuffs)
+        internal static void Scanner(string message, InterfaceControls.Icon icon = InterfaceControls.Icon.handcuffs, bool scannerSound = true)
         {
             try
             {
                 var ic = InterfaceController.Instance;
                 if (ic == null) return;
-                ic.NewGameMessage(InterfaceController.GameMessageType.notification, 0, message, icon);
+                // The 5th arg (additionalSFX) overrides the message's sound. For an ARREST alert we force the enforcer
+                // scanner blip (so every arrest gets it, not just the first). For the case-form COLLECT/SUBMIT banners we
+                // pass null so the game plays that notification's OWN (correct) sound - forcing the scanner blip there was
+                // overriding the real submission sound.
+                AudioEvent sfx = null; if (scannerSound) { try { sfx = AudioControls.Instance.enforcerScannerMsg; } catch { } }
+                ic.NewGameMessage(InterfaceController.GameMessageType.notification, 0, message, icon, sfx);
             }
             catch (Exception e) { Log($"Scanner error: {e.Message}"); }
         }
@@ -139,7 +197,7 @@ namespace Narcotics
         {
             // Vanilla sequence: the "Collected Form" scanner blip + the case-title typewriter header fire together,
             // then a second typewriter header with the time/date/location.
-            try { Scanner("Collected Form: " + SafeName(Current), InterfaceControls.Icon.resolve); } catch (Exception e) { Log($"OnFormCollected scanner error: {e.Message}"); }
+            try { Scanner("Collected Form: " + SafeName(Current), InterfaceControls.Icon.resolve, scannerSound: false); } catch (Exception e) { Log($"OnFormCollected scanner error: {e.Message}"); }
             Header(SafeName(Current));          // header 1: the case title (with the scanner)
             Header(TimeLocationString());       // header 2: time, date, location
         }
@@ -150,7 +208,154 @@ namespace Narcotics
         {
             string msg = ""; try { msg = Strings.Get("ui.gamemessage", "case submitted"); } catch { }
             if (string.IsNullOrEmpty(msg)) msg = "Case submitted for processing. Please wait for results.";
-            try { Scanner(msg, InterfaceControls.Icon.resolve); } catch (Exception e) { Log($"OnFormSubmitted error: {e.Message}"); }
+            try { Scanner(msg, InterfaceControls.Icon.resolve, scannerSound: false); } catch (Exception e) { Log($"OnFormSubmitted error: {e.Message}"); }
+            // SetStatus(submitted) only set each question's isCorrect + repainted; the actual VERDICT (isSolved, the
+            // credit reward/penalty via GameplayController.AddMoney, the solved/unsolved display, -> closable) lives in
+            // Case.Resolve(). Vanilla reaches it via the "case processing" wait; we run it ourselves after a short
+            // processing delay. Resolve() is SAFE for a custom case (its murder derefs are caseType-gated/null-guarded).
+            // Each submit arms a fresh verdict - the _resolvingSelf guard is per-call, so a retry after a fail re-resolves
+            // cleanly with no stale/duplicate (that was the double-resolve + stuck-processing bug).
+            _pendingVerdict = true; _pendingVerdictAt = UnityEngine.Time.time;
+        }
+
+        // Called every frame (NarcoticsHotkey.Update). After the processing delay, drive the ONE Case.Resolve() that
+        // the engine never calls for a custom case (decode: zero engine callers of Resolve for custom). Resolve() is
+        // safe + nearly complete for custom: it plays the answer reveal + the Solved/Unsolved banner, pays the money
+        // reward on solve / penalty + reopen-for-retry on fail, and sets closable - all in vanilla ordering. The ONE
+        // thing it skips for custom is SOCIAL CREDIT (ExecuteMissionCompleteDisplay bare-returns for caseType 3/4), so
+        // we inject only that. A solved case's pointer is latched (ResolvedPtrs) so a stray second Resolve cannot
+        // replay the whole sequence (that was the double reveal+banner bug).
+        internal static void TickVerdict()
+        {
+            if (!_pendingVerdict) return;
+            try
+            {
+                if (UnityEngine.Time.time - _pendingVerdictAt < ProcessingDelaySec) return;
+                _pendingVerdict = false;
+                if (!IsOpen) return;
+
+                GradeSpecialQuestions(true);   // grade the arrest + location rows ourselves (engine's murder-linked checks don't fire for custom); log at the verdict
+
+                // One engine-owned verdict. _resolvingSelf lets THIS call through Patch_CaseResolve; the latch below
+                // swallows any later re-entry. Leave each question's reward/penalty INTACT so Resolve pays them (do
+                // NOT zero them and do NOT hand-emit money - the engine owns money + ordering).
+                _resolvingSelf = true;
+                try { Current.Resolve(); } catch (Exception e) { Log($"Resolve threw: {e.Message}"); }
+                _resolvingSelf = false;
+
+                bool solved = false; try { solved = Current.isSolved; } catch { }
+                if (solved)
+                {
+                    try { ResolvedPtrs.Add(Current.Pointer); } catch { }   // latch: never re-resolve this solved case
+                    // Resolve pays the money reward but grants NO social credit for a custom case - inject it. With
+                    // displayMessage=true it shows its own "+N" + any level-up banner + refreshes perks.
+                    try { var gc = GameplayController.Instance; if (gc != null) gc.AddSocialCredit(SolveSocialCredit, true, "Narcotics case solved"); } catch (Exception e) { Log($"AddSocialCredit error: {e.Message}"); }
+                }
+                Log($"verdict: isSolved={solved} (money + banner owned by Case.Resolve; {(solved ? $"+{SolveSocialCredit} social credit injected + pointer latched" : "penalty paid by Resolve, case reopened for retry")}).");
+            }
+            catch (Exception e) { _pendingVerdict = false; Log($"TickVerdict error: {e.Message}"); }
+        }
+
+        // Grade the ARREST and LOCATION rows ourselves right before Resolve. Vanilla's arrestPurp check is tied to the
+        // murder case's killer and its location check expects the engine's own evidence linkage - neither fires for a
+        // CaseType.custom case, so we set each question's isCorrect from live game state: the arrest ticks when the cook
+        // is restrained; the location ticks when the player's answer is the lab's directory index. (Citizen questions
+        // the engine already grades correctly, so we leave them.) Logs the inputs so any residual mismatch is visible.
+        internal static void GradeSpecialQuestions(bool log = false)
+        {
+            try
+            {
+                var c = Current; if (c == null || !IsOpen) return;
+                var qs = c.resolveQuestions; if (qs == null) return;
+                bool cookCuffed = Operation.CookRestrained();
+                string labName = null; try { labName = Operation.LabLoc != null ? Operation.LabLoc.name : null; } catch { }
+                // Did the player NAME the cook correctly in the producer row? The arrest row only ticks once the cook is
+                // both identified AND in handcuffs (vanilla: the arrest check keys off the named killer).
+                bool producerNamed = false;
+                for (int i = 0; i < qs.Count; i++) { var pq = qs[i]; if (pq == null) continue; string pn = null; try { pn = pq.name; } catch { } if (pn == QProducing) { try { producerNamed = pq.isCorrect; } catch { } break; } }
+                for (int i = 0; i < qs.Count; i++)
+                {
+                    var q = qs[i]; if (q == null) continue;
+                    string nm = null; try { nm = q.name; } catch { }
+                    if (nm == QCookArrested)
+                    {
+                        bool arrested = producerNamed && cookCuffed;
+                        // Set BOTH isValid AND isCorrect: the LIVE checkbox painter (InputFieldController.UpdateCheckbox,
+                        // resultsMode=false) reads the question's isValid byte (0xAC) as well as isCorrect (0xAD) to pick
+                        // the tick sprite; the results screen reads only isCorrect. Setting only isCorrect is why the box
+                        // graded correct at the end but never ticked LIVE while filling the form. Then repaint the row -
+                        // the engine only auto-repaints a row when its OWN UpdateCorrect fires OnProgressChange, which our
+                        // arrest row's never does (no murder wires its naming-question reference), so we drive it.
+                        try { q.isValid = arrested; } catch { }
+                        try { q.isCorrect = arrested; } catch { }
+                        RepaintResolveRow(q);
+                        if (log) Log($"[grade] cook arrested: namedCook={producerNamed} restrained={cookCuffed} -> {arrested}");
+                    }
+                    else if (nm == QLabLocation)
+                    {
+                        // The player's answer is stored as the location's NAME (e.g. 'Vacant address 1, Zeng Terrace'),
+                        // so compare it to the lab's name (case/whitespace-insensitive), not the directory index.
+                        string inp = null, inpEv = null; try { inp = q.input; } catch { } try { inpEv = q.inputtedEvidence; } catch { }
+                        bool ok = !string.IsNullOrEmpty(labName) &&
+                                  ((inp != null && string.Equals(inp.Trim(), labName.Trim(), StringComparison.OrdinalIgnoreCase)) ||
+                                   (inpEv != null && string.Equals(inpEv.Trim(), labName.Trim(), StringComparison.OrdinalIgnoreCase)));
+                        try { q.isValid = ok; } catch { }   // live checkbox needs isValid too (see arrest row note above)
+                        try { q.isCorrect = ok; } catch { }
+                        RepaintResolveRow(q);
+                        if (log) Log($"[grade] location: input='{inp}' inputEv='{inpEv}' labName='{labName}' -> {ok}");
+                    }
+                }
+            }
+            catch (Exception e) { if (log) Log($"GradeSpecialQuestions error: {e.Message}"); }
+        }
+
+        // Repaint ONE resolve-form row's checkbox so a correctness change WE made in data shows LIVE. The engine paints
+        // a row's checkbox via InputFieldController.UpdateCheckbox (from the question's isValid/isCorrect), but only
+        // calls it when the row's own UpdateCorrect succeeds and fires OnProgressChange - which our arrest/location
+        // rows never do (no backing murder), so we call UpdateCheckbox ourselves. No-op when the resolve form isn't
+        // open (e.g. grading at verdict time). Matches the live field to the question by pointer.
+        private static void RepaintResolveRow(Case.ResolveQuestion q)
+        {
+            try
+            {
+                if (q == null) return;
+                var rc = ResolveController.Instance; if (rc == null) return;
+                var fields = rc.spawnedInputFields; if (fields == null) return;
+                for (int i = 0; i < fields.Count; i++)
+                {
+                    var f = fields[i]; if (f == null) continue;
+                    Case.ResolveQuestion fq = null; try { fq = f.question; } catch { }
+                    if (fq == null) continue;
+                    try { if (fq.Pointer != q.Pointer) continue; } catch { continue; }
+                    try { f.UpdateCheckbox(); } catch { }
+                    return;   // one field per question
+                }
+            }
+            catch { }
+        }
+
+        // Register the resolve-question labels as self-resolving keys in missions.postings (key == value), so
+        // ResolveQuestion.GetText (which treats `name` as a key) returns the text instead of blank. Deduped: once the
+        // key resolves to itself it is already registered (a MISSING key returns the "new objective" fallback), so we
+        // never re-write it and the game's string CSV does not accumulate duplicates across sessions.
+        internal static void RegisterStrings()
+        {
+            TryRegisterKey("missions.postings", QProducing);
+            TryRegisterKey("missions.postings", QLabLocation);
+            TryRegisterKey("missions.postings", QCookArrested);
+            TryRegisterKey("missions.postings", QTransporting);
+            TryRegisterKey("missions.postings", QDealing);
+        }
+
+        private static void TryRegisterKey(string dict, string key)
+        {
+            try
+            {
+                string existing = null; try { existing = Strings.Get(dict, key); } catch { }
+                if (!string.IsNullOrEmpty(existing) && existing == key) return;   // already a self-resolving key
+                Strings.WriteToDictionary(dict, key, "", key, "", 0, false, "");
+            }
+            catch (Exception e) { Log($"TryRegisterKey({key}) error: {e.Message}"); }
         }
 
         // Fire one typewriter game-header (InterfaceController GameMessageType.gameHeader - the big centre header that
@@ -184,16 +389,23 @@ namespace Narcotics
 
         // Stop tracking the case (e.g. once the player has solved/closed it) without touching the game's Case
         // object, which stays on the board for them.
-        internal static void MarkClosed() { Current = null; SubjectId = -1; }
+        // Keep ResolvedPtrs across close: a solved case's pointer stays latched so a stray post-close Resolve is still swallowed.
+        internal static void MarkClosed() { Current = null; SubjectId = -1; _pendingVerdict = false; _resolvingSelf = false; try { _leads.Clear(); } catch { } }
 
         // Clear the "Explore Reported Crime Scene" lead the moment the player engages the arrested suspect - talking
         // to them or searching them is the whole point of that lead, so it is done on contact. Uses Objective.Cancel()
         // (which only removes the HUD pointer + awareness icon; no murder-state side effects), NOT Complete() whose
         // murder branch could deref the backing murder our synthetic case lacks. Idempotent + pointer-safe.
-        internal static void ClearLead(string via)
+        // Clear the "Search <name>" lead for ONE specific arrested buyer (the player frisked them). Keyed by humanID so
+        // searching buyer A never clears buyer B's still-open lead. Uses Objective.Cancel() (HUD pointer + icon only;
+        // no murder-state side effects). Idempotent + pointer-safe.
+        internal static void ClearLeadFor(int humanID, string via)
         {
             try
             {
+                string leadTxt = null;
+                if (!_leads.TryGetValue(humanID, out leadTxt) || string.IsNullOrEmpty(leadTxt)) return;
+                _leads.Remove(humanID);
                 if (!IsOpen) return;
                 var list = Current.currentActiveObjectives;
                 if (list == null) return;
@@ -202,31 +414,26 @@ namespace Narcotics
                     Objective o = null; try { o = list[i]; } catch { }
                     if (o == null) continue;
                     try { if (o.isComplete || o.isCancelled) continue; } catch { }
-                    if (!IsLeadObjective(o)) continue;
+                    if (!IsLeadObjective(o, leadTxt)) continue;
                     try { o.Cancel(); } catch (Exception e) { Log($"search-lead Cancel threw: {e.Message}"); }
                     try { CasePanelController.Instance.UpdateCaseControls(); } catch { }
-                    Log($"cleared the 'search the suspect' lead ({via}).");
+                    Log($"cleared the search lead for #{humanID} ({via}).");
                     return;   // Cancel mutates the list; stop iterating
                 }
             }
-            catch (Exception e) { Log($"ClearLead error: {e.Message}"); }
+            catch (Exception e) { Log($"ClearLeadFor error: {e.Message}"); }
         }
 
-        // Is this the "Search <name> at <loc>" lead (and not the City Hall collect objective)? Match on the exact lead
-        // text we stored, else on the "Search" wording - the collect objective says "Collect a case resolution form
-        // from City Hall", so it never matches.
-        private static bool IsLeadObjective(Objective o)
+        // Does this objective match the SPECIFIC lead text (exact name/entryRef match only - no "Search" substring
+        // wildcard, which previously cross-matched every search lead and collapsed multiple arrests into one).
+        private static bool IsLeadObjective(Objective o, string leadTxt)
         {
             try
             {
+                if (string.IsNullOrEmpty(leadTxt)) return false;
                 string nm = null; try { nm = o.name; } catch { }
-                if (!string.IsNullOrEmpty(LeadText))
-                {
-                    if (nm == LeadText) return true;
-                    try { var qe = o.queueElement; if (qe != null && qe.entryRef == LeadText) return true; } catch { }
-                }
-                if (!string.IsNullOrEmpty(nm) && nm.IndexOf("Search ", StringComparison.OrdinalIgnoreCase) >= 0)
-                    return true;
+                if (nm == leadTxt) return true;
+                try { var qe = o.queueElement; if (qe != null && qe.entryRef == leadTxt) return true; } catch { }
             }
             catch { }
             return false;
@@ -248,11 +455,10 @@ namespace Narcotics
                 NewGameLocation loc = null; try { loc = subject != null ? subject.currentGameLocation : null; } catch { }
                 Vector3 pos = default; try { if (node != null) pos = node.position; } catch { }
                 string where = null; try { if (loc != null) where = loc.name; } catch { }
-                string name = null; try { if (subject != null) name = subject.citizenName; } catch { }
-                if (string.IsNullOrEmpty(name)) name = "the suspect";
+                string name = CleanName(subject);
 
                 string leadTxt = string.IsNullOrEmpty(where) ? $"Search {name}" : $"Search {name} at {where}";
-                LeadText = leadTxt;   // remember the exact text so searching the suspect can clear this lead
+                try { int id = subject != null ? subject.humanID : -1; if (id != -1) _leads[id] = leadTxt; } catch { }   // per-buyer lead
                 // Trigger type `nothing` = never auto-completes (goToNode would clear it the moment the player arrives);
                 // the pointer still routes the player to the suspect via usePointer + pointerPosition.
                 var leadTrig = new Objective.ObjectiveTrigger(Objective.ObjectiveTriggerType.nothing, "", false, 0f, null, null, null, node, null, loc, null, "", false, pos);
@@ -331,11 +537,27 @@ namespace Narcotics
                 // the bust. SECONDARY (optional bonus): the street DEALER the interrogation trail points to. The
                 // correct answer is the citizen's humanID as a string (ResolveQuestion.UpdateCorrect feeds each
                 // correctAnswers entry to CityData.GetHuman). Cook from the active operation; dealer from the trail.
+                RegisterStrings();   // make the question labels resolvable BEFORE the questions/objectives are built
                 int cookId = -1; try { if (Operation.CookHuman != null) cookId = Operation.CookHuman.humanID; } catch { }
+                int distId = -1; try { if (Operation.Distributors != null && Operation.Distributors.Count > 0 && Operation.Distributors[0].H != null) distId = Operation.Distributors[0].H.humanID; } catch { }
                 int dealerId = -1; try { int bid = subject != null ? subject.humanID : -1; var dl = Operation.DealerFor(bid); if (dl != null) dealerId = dl.humanID; } catch { }
-                AddQuestion(c, "Who is producing the drug?", required: true,  reward: new Vector2(600f, 900f), penalty: new Vector2(150f, 300f), correctHumanId: cookId);
-                AddQuestion(c, "Who is dealing the drug?",   required: false, reward: new Vector2(200f, 400f), penalty: new Vector2(50f, 150f),  correctHumanId: dealerId);
-                Log($"resolve answers: cook#{cookId}, dealer#{dealerId}.");
+                // The full bust form, in trail order. Producing is the REQUIRED target of the bust; the rest are bonus
+                // rows (no penalty) that reward following the chain. Lab location is a LOCATION pick (unscored for now -
+                // see AddQuestion). "Has the cook been arrested?" is an arrestPurp row = the vanilla boolean CHECKMARK
+                // that ticks when the identified cook is in custody (UpdateCorrect checks the correct citizen is
+                // restrained), keyed to the cook.
+                // The location answer is the lab's INDEX in CityData.gameLocationDirectory as a string (vanilla stores
+                // the killer's home the same way, e.g. "565"), NOT the display name.
+                string labId = Operation.LabDirIndex();
+                // ORDER MATTERS: the arrestPurp "arrested?" checkmark sits DIRECTLY under the cook-identify row (vanilla
+                // puts "arrest the murderer" right under "who killed them" - the arrest row keys off the citizen named
+                // in the row above + whether they're in handcuffs). So: produce -> arrested -> location -> transport -> deal.
+                AddQuestion(c, QProducing,    required: true,  reward: 300, penalty: 100, correctHumanId: cookId);   // the NAMING question (citizen) - the arrest row below reads its answer
+                AddQuestion(c, QCookArrested, required: false, reward: 100, penalty: 0,   inputType: Case.InputType.arrestPurp);   // correctAnswers EMPTY (like vanilla "Arrest the killer"): it checks the person named in the citizen row above is in handcuffs
+                AddQuestion(c, QLabLocation,  required: false, reward: 150, penalty: 0,   inputType: Case.InputType.location, correctLocation: labId);   // lab pick, matched by gameLocationDirectory index (like vanilla's "where does the killer live")
+                AddQuestion(c, QTransporting, required: false, reward: 150, penalty: 0,   correctHumanId: distId);   // the distributor
+                AddQuestion(c, QDealing,      required: false, reward: 150, penalty: 0,   correctHumanId: dealerId);  // the street dealer
+                Log($"resolve answers: cook#{cookId}, distributor#{distId}, dealer#{dealerId}; lab location dir-index='{labId}'.");
                 Log($"added {c.resolveQuestions.Count} resolve question(s).");
             }
             catch (Exception e) { Log($"AddResolveQuestions error: {e.Message}"); }
@@ -344,27 +566,38 @@ namespace Narcotics
         // Add one citizen-identify resolve question. `name` is forced onto the form row by Patch_InputFieldSetup
         // (GetText treats it as a localization key = blank otherwise); displayObjective=false stops the engine
         // auto-spawning a blank objective from it on collect.
-        private static void AddQuestion(Case c, string label, bool required, Vector2 reward, Vector2 penalty, int correctHumanId = -1)
+        private static void AddQuestion(Case c, string label, bool required, int reward, int penalty, int correctHumanId = -1, Case.InputType inputType = Case.InputType.citizen, string correctLocation = null)
         {
             try
             {
                 var q = new Case.ResolveQuestion();
                 try { q.name = label; } catch { }
-                // The correct answer: the citizen's humanID as a string (UpdateCorrect feeds it to CityData.GetHuman).
-                if (correctHumanId >= 0)
+                // Location correct-answer: the lab's gameLocationDirectory INDEX as a string (confirmed from a vanilla
+                // murder dump: "where does the killer live" stored correct='565', an index - not the display name).
+                if (inputType == Case.InputType.location && !string.IsNullOrEmpty(correctLocation))
+                {
+                    try { q.correctAnswers = new Il2CppSystem.Collections.Generic.List<string>(); q.correctAnswers.Add(correctLocation); } catch { }
+                }
+                // The correct answer for a CITIZEN pick: the citizen's humanID as a string (UpdateCorrect matches it
+                // against the picked citizen's humanID.ToString()). For a LOCATION pick the correct-answer identifier
+                // format is not yet confirmed from the decode, so the lab-location row is left UNSCORED for now (renders
+                // + is fillable + submittable; optional so it never penalises) - we wire the grading once we see in-game
+                // what the picker returns.
+                if ((inputType == Case.InputType.citizen || inputType == Case.InputType.arrestPurp) && correctHumanId >= 0)
                 {
                     try { q.correctAnswers = new Il2CppSystem.Collections.Generic.List<string>(); q.correctAnswers.Add(correctHumanId.ToString()); } catch { }
                 }
                 // displayObjective=true mimics vanilla: on collect, Case.SetStatus spawns one objective per question
                 // (each with a banner + a submitCase trigger). Those submit-objectives are what make the City Hall
-                // tray offer the HAND-IN action, so without them the form can't be submitted. Their text comes out
-                // right because Patch_ObjectiveSetup copies our entryRef (the question name) onto the objective name.
+                // tray offer the HAND-IN action, so without them the form can't be submitted.
                 try { q.displayObjective = true; } catch { }
-                try { q.inputType = Case.InputType.citizen; } catch { }
-                try { q.icon = InterfaceControls.Icon.citizen; } catch { }
+                try { q.inputType = inputType; } catch { }
+                try { q.icon = inputType == Case.InputType.location ? InterfaceControls.Icon.location : InterfaceControls.Icon.citizen; } catch { }
                 try { q.isOptional = !required; } catch { }
-                try { q.rewardRange = reward; } catch { }
-                try { q.penaltyRange = penalty; } catch { }
+                // Case.Resolve()'s AddMoney reads the INT fields (reward on solve, penalty on a wrong REQUIRED answer),
+                // NOT the ranges - setting only rewardRange/penaltyRange left the money at 0. Set both.
+                try { q.reward = reward; q.penalty = penalty; } catch { }
+                try { q.rewardRange = new Vector2(reward, reward); q.penaltyRange = new Vector2(penalty, penalty); } catch { }
                 c.resolveQuestions.Add(q);
             }
             catch (Exception e) { Log($"AddQuestion error: {e.Message}"); }
@@ -387,9 +620,11 @@ namespace Narcotics
                 }
                 else if (st == Case.CaseStatus.handInCollected)
                 {
-                    try { Current.Resolve(); } catch (Exception e) { Log($"Resolve threw: {e.Message}"); }
+                    // Route through the SAME path as the City Hall tray (Patch_HandInCase): set submitted + arm the one
+                    // TickVerdict Resolve. Do NOT call Resolve() directly here - that was a second verdict source.
                     try { Current.SetStatus(Case.CaseStatus.submitted, true); } catch (Exception e) { Log($"SetStatus(submitted) threw: {e.Message}"); }
-                    Log("DEBUG hand-in: SUBMITTED (Resolve + status -> submitted). Did it solve/score cleanly?");
+                    OnFormSubmitted();
+                    Log("DEBUG hand-in: SUBMITTED (status -> submitted; the single verdict runs after the processing delay).");
                 }
                 else Log($"DEBUG hand-in: case status is {st}; nothing to step.");
             }
@@ -410,9 +645,16 @@ namespace Narcotics
             catch { return false; }
         }
 
-        internal static void ResetOnLoad() { Current = null; SubjectId = -1; }
+        internal static void ResetOnLoad() { Current = null; SubjectId = -1; _pendingVerdict = false; _resolvingSelf = false; try { ResolvedPtrs.Clear(); } catch { } try { _leads.Clear(); } catch { } }
 
         private static string SafeName(Case c) { try { return c.name; } catch { return "?"; } }
+
+        // A clean, player-facing citizen name (no "#id" suffix, unlike NarcoticsPlugin.Name which is for logs).
+        private static string CleanName(Human h)
+        {
+            try { var n = h != null ? h.citizenName : null; if (!string.IsNullOrEmpty(n)) return n; } catch { }
+            return "a suspect";
+        }
         static void Log(string m) => NarcoticsPlugin.Log.LogInfo("[Narcotics][case] " + m);
     }
 }

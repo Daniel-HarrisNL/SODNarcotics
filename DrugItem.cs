@@ -13,10 +13,100 @@ namespace Narcotics
         internal static InteractablePreset Current;      // the active operation's cloned drug preset
         internal static string CurrentKey;
         internal static string CurrentDisplay;
+        internal const string DrugDescription = "A mysterious new substance";   // examine-panel description
+        internal static string DescTreeId;   // cached custom DDS document-tree id that renders DrugDescription (see EnsureDescTree)
+        private static readonly System.Random _rng = new System.Random();
+        private static System.Collections.Generic.List<InteractablePreset> _basePool;   // per-session pool of drug-item bases; one picked per case for photo variety
+        // Every drug preset WE created this session (clone pointer -> its display name). The card patches scope by
+        // membership here rather than the single Current, so EVERY one of our doses renders its own name + our caption,
+        // even when several different drugs exist at once (the test-spawn key) or across cases. Cleared on load.
+        private static readonly System.Collections.Generic.Dictionary<IntPtr, string> _drugNames = new System.Collections.Generic.Dictionary<IntPtr, string>();
+
+        // True if this preset is one of our drug clones. NameFor returns its display name (null if not ours).
+        internal static bool IsOurDrugPreset(InteractablePreset p)
+        {
+            try { return p != null && _drugNames.ContainsKey(p.Pointer); } catch { return false; }
+        }
+        internal static string NameFor(InteractablePreset p)
+        {
+            try { if (p != null && _drugNames.TryGetValue(p.Pointer, out var n)) return n; } catch { }
+            return null;
+        }
 
         // On a game load the cached presets reference a previous session's (destroyed) objects; clear them so a
         // fresh drug is created next operation.
-        internal static void ResetOnLoad() { BasePreset = null; Current = null; CurrentKey = null; CurrentDisplay = null; }
+        internal static void ResetOnLoad() { BasePreset = null; Current = null; CurrentKey = null; CurrentDisplay = null; DescTreeId = null; _basePool = null; _drugNames.Clear(); }
+
+        // Register (once per session) a custom DDS document tree whose single always-display block renders the drug's
+        // examine DESCRIPTION ("A mysterious new substance"), and return its id. This id is set as our cloned
+        // EvidencePreset.ddsDocumentID (CreateDrug), so the EVIDENCE CARD shows our text under the item photo while the
+        // card/photo/title stay native. (The earlier approach set it via Interactable.SetDDSOverride, which turned the
+        // item into a readable DOCUMENT - a big crumpled page - and regressed the perfect card; that route is removed.)
+        // Same block/message/tree pipeline the game + our Motives notes use (Toolbox.allDDS* dictionaries + Strings
+        // 'dds.blocks' table). Returns null on failure (the dose then keeps the base description). Session-only; cleared
+        // in ResetOnLoad.
+        internal static string EnsureDescTree()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(DescTreeId)) return DescTreeId;
+                var tb = Toolbox.Instance; if (tb == null) return null;
+                string uid = System.Guid.NewGuid().ToString("N");
+                string blockKey = "narc.desc.block." + uid;
+                string messageKey = "narc.desc.msg." + uid;
+                string treeId = "narc.desc.tree." + uid;
+
+                // 1) block text -> the dds.blocks table + register the block object.
+                int lineNo = 1;
+                try { var st = Strings.stringTable; if (st != null && st.ContainsKey("dds.blocks")) lineNo = st["dds.blocks"].Count + 1; } catch { }
+                try { Strings.LoadIntoDictionary("dds.blocks", lineNo, blockKey, DrugDescription, "", 0, false, true); } catch (Exception e) { Log($"EnsureDescTree LoadIntoDictionary: {e.Message}"); }
+                var block = new DDSSaveClasses.DDSBlockSave();
+                block.name = blockKey; block.id = blockKey;
+                try { block.replacements = new Il2CppSystem.Collections.Generic.List<DDSSaveClasses.DDSReplacement>(); } catch { }
+                try { tb.allDDSBlocks[blockKey] = block; } catch { }
+
+                // 2) message pointing at the block (alwaysDisplay).
+                var msg = new DDSSaveClasses.DDSMessageSave();
+                msg.name = messageKey; msg.id = messageKey;
+                msg.blocks = new Il2CppSystem.Collections.Generic.List<DDSSaveClasses.DDSBlockCondition>();
+                try { msg.AddBlock(blockKey); } catch { }
+                try { var c = msg.blocks[0]; c.alwaysDisplay = true; c.group = 0; try { c.useTraits = false; } catch { } try { c.traits = new Il2CppSystem.Collections.Generic.List<string>(); } catch { } } catch { }
+                try { tb.allDDSMessages[messageKey] = msg; } catch { }
+
+                // 3) document tree pointing at the message.
+                var tree = new DDSSaveClasses.DDSTreeSave();
+                tree.name = treeId; tree.id = treeId;
+                try { tree.treeType = DDSSaveClasses.TreeType.document; } catch { }
+                tree.messages = new Il2CppSystem.Collections.Generic.List<DDSSaveClasses.DDSMessageSettings>();
+                tree.messageRef = new Il2CppSystem.Collections.Generic.Dictionary<string, DDSSaveClasses.DDSMessageSettings>();
+                try { tree.document = new DDSSaveClasses.DDSDocument(); } catch { }
+                string inst = null; try { inst = tree.AddMessage(messageKey); } catch { }
+                try { tree.startingMessage = inst; } catch { }
+                // This tree is attached as the EVIDENCE CARD's writeup (EvidencePreset.ddsDocumentID), which renders the
+                // block text under the item photo in the card's own style - NOT the full document reader. So we DON'T set
+                // reader layout (CrumpledPaper background, page size, paging): that is what the old Interactable.SetDDSOverride
+                // route produced (a big crumpled page replacing the card). Keep only a modest font as a harmless hint; the
+                // card controls presentation.
+                try
+                {
+                    DDSSaveClasses.DDSMessageSettings ms = null;
+                    try { if (tree.messages != null && tree.messages.Count > 0) ms = tree.messages[0]; } catch { }
+                    if (ms != null)
+                    {
+                        try { ms.font = "TruetypewriterPolyglott SDF"; } catch { }
+                        try { ms.fontSize = 11f; } catch { }
+                        try { if (tree.messageRef != null && !string.IsNullOrEmpty(inst)) tree.messageRef[inst] = ms; } catch { }
+                    }
+                }
+                catch { }
+                try { tb.allDDSTrees[treeId] = tree; } catch { }
+
+                DescTreeId = treeId;
+                Log($"registered drug description DDS tree ({treeId}).");
+                return DescTreeId;
+            }
+            catch (Exception e) { Log($"EnsureDescTree error: {e.Message}"); return null; }
+        }
 
         // Find a vanilla consumable to base the drug on. Beta blockers preferred; any small
         // pill/medical consumable is an acceptable fallback.
@@ -53,15 +143,66 @@ namespace Narcotics
             catch (Exception e) { Log($"FindBasePreset error: {e.Message}"); return null; }
         }
 
-        // Clone the base into a uniquely named drug preset. Never mutates the shared base.
-        internal static InteractablePreset CreateDrug(string presetKey, string displayName)
+        // Known-good drug/medical item preset names for PER-CASE PHOTO VARIETY (the user curated these in-game): each is a
+        // small examinable item that renders the pill-bottle-style evidence card, so picking a different one per case
+        // varies the photo while our GetSummary/GenerateName patches (base-agnostic, keyed on the dose's preset) still
+        // drive the caption + title. Matched as a squashed substring so "Dorma-Dix"/"Birth Control Pills" etc. hit
+        // regardless of spacing/case/hyphens.
+        private static readonly string[] DrugBaseTerms = { "betablocker", "paxadol", "dorma", "poison", "insulin", "syringe", "birthcontrol", "sleepingpill", "painkiller" };
+
+        // Build the per-session pool of drug-item bases: every preset whose squashed name matches a term AND spawns
+        // evidence (so it examines as a card). Logged so the matched set is visible after a run. Empty pool -> PickBase
+        // falls back to the single beta-blocker pick.
+        internal static System.Collections.Generic.List<InteractablePreset> FindBasePool(bool log = true)
+        {
+            var pool = new System.Collections.Generic.List<InteractablePreset>();
+            try
+            {
+                var tb = Toolbox.Instance; var dict = tb != null ? tb.objectPresetDictionary : null;
+                if (dict == null) return pool;
+                foreach (InteractablePreset preset in dict.Values)
+                {
+                    if (preset == null) continue;
+                    string nm = SafeName(preset); if (string.IsNullOrEmpty(nm)) continue;
+                    string low = nm.ToLowerInvariant().Replace(" ", "").Replace("-", "").Replace("_", "");
+                    bool match = false;
+                    for (int i = 0; i < DrugBaseTerms.Length; i++) if (low.Contains(DrugBaseTerms[i])) { match = true; break; }
+                    if (!match) continue;
+                    bool hasEv = false; try { hasEv = preset.spawnEvidence != null; } catch { }
+                    if (!hasEv) { if (log) Log($"  base-pool SKIP (no evidence): '{nm}'"); continue; }
+                    pool.Add(preset);
+                    if (log) Log($"  base-pool: '{nm}'");
+                }
+                if (log) Log($"FindBasePool: {pool.Count} drug-item base(s) for per-case photo variety.");
+            }
+            catch (Exception e) { Log($"FindBasePool error: {e.Message}"); }
+            return pool;
+        }
+
+        // Pick a random drug-item base for this case (photo variety). Falls back to the single beta-blocker pick if the
+        // pool is empty (e.g. no names matched). Pool is discovered once per session and cached.
+        internal static InteractablePreset PickBase()
         {
             try
             {
-                if (BasePreset == null) BasePreset = FindBasePreset();
-                if (BasePreset == null) { Log("CreateDrug: no base preset found (run the substrate dump to see item names)"); return null; }
+                if (_basePool == null) _basePool = FindBasePool();
+                if (_basePool != null && _basePool.Count > 0) return _basePool[_rng.Next(_basePool.Count)];
+            }
+            catch (Exception e) { Log($"PickBase error: {e.Message}"); }
+            return FindBasePreset();
+        }
 
-                var clone = UnityEngine.Object.Instantiate(BasePreset);
+        // Clone the base into a uniquely named drug preset. Never mutates the shared base. `forceBase` pins a specific
+        // base (used by the test key to cycle bases deterministically); otherwise a random pool pick gives per-case variety.
+        internal static InteractablePreset CreateDrug(string presetKey, string displayName, InteractablePreset forceBase = null)
+        {
+            try
+            {
+                var baseP = forceBase ?? PickBase();   // a specific or random drug-item base; random gives per-case photo variety
+                if (baseP == null) { Log("CreateDrug: no base preset found (run the substrate dump to see item names)"); return null; }
+                BasePreset = baseP;
+
+                var clone = UnityEngine.Object.Instantiate(baseP);
                 if (clone == null) { Log("CreateDrug: Instantiate returned null"); return null; }
                 UnityEngine.Object.DontDestroyOnLoad(clone);
                 try { clone.hideFlags = HideFlags.HideAndDontSave; } catch { }
@@ -72,19 +213,69 @@ namespace Narcotics
                 // line-of-sight to a known buyer, not from vanilla contraband detection.
                 try { clone.inventoryCarryItem = false; } catch { }
                 try { clone.requiredCarryAnimation = false; } catch { }
+                // The base (beta blockers etc.) is a RETAIL consumable, which (a) typed the dose as EvidenceRetailItem so
+                // its name came from the shop/retail config instead of our evidence.names write (showing "retail item" or
+                // an inconsistent cached name), and (b) let the player TAKE/consume it. Strip both: null the retail link so
+                // the name resolves through evidence.names (below), and zero the consumable + take flags so it can't be
+                // taken or used - it is clue evidence only, frisked/searched but not pocketed or swallowed.
+                try { clone.retailItem = null; } catch (Exception e) { Log($"CreateDrug: clear retailItem failed: {e.Message}"); }
+                try { clone.consumableAmount = 0f; } catch { }
+                try { clone.destroyWhenAllConsumed = false; } catch { }
+                try { clone.takeWith = false; } catch { }
+
+                // Declassify any WEAPON base (the Syringe is a MurderWeaponPreset, so it offered "attack/throw" instead of
+                // the normal "place/throw"): null the weapon preset so the dose behaves like a regular object, matching the
+                // other drug items. (weapon is the only weapon field on InteractablePreset.)
+                try { clone.weapon = null; } catch (Exception e) { Log($"CreateDrug: clear weapon failed: {e.Message}"); }
+                // FINGERPRINTS (the forensic trail): some bases (syringe / insulin injector / birth control pills) ship
+                // with dynamic prints effectively OFF - the flags off AND/OR the dynamic-print count capped at 0 - so
+                // handling never stamped a print (dusting showed nothing). Force the whole set on: enable flags, lift any
+                // zero cap (override + a sane max), and ensure non-zero density, so every base stamps prints like the boxes.
+                try { clone.fingerprintsEnabled = true; } catch { }
+                try { clone.enableDynamicFingerprints = true; } catch { }
+                try { clone.disableDynamicFingerprintsFromStaticPrintsSources = false; } catch { }
+                try { clone.overrideMaxDynamicFingerprints = true; } catch { }
+                try { if (clone.maxDynamicFingerprints < 10) clone.maxDynamicFingerprints = 10; } catch { }
+                try { if (clone.fingerprintDensity <= 0f) clone.fingerprintDensity = 1f; } catch { }
+
+                // The card's examine DESCRIPTION (the writeup under the item photo) is substituted per-dose by a Harmony
+                // patch on the writeup getter (Patch_DrugItemDescription in Diagnostics.cs), NOT by touching the evidence
+                // preset: cloning the EvidencePreset blanked the whole card (name/photo/writeup all resolve off the shared
+                // preset's identity + registration, which an Instantiate'd copy loses), and mutating the shared base would
+                // change every real beta blocker. So the clone keeps the base's spawnEvidence untouched and the patch swaps
+                // only the displayed text for our dose.
 
                 // Register so lookups and evidence naming resolve to the clone.
                 try { Toolbox.Instance.objectPresetDictionary[presetKey] = clone; } catch (Exception e) { Log($"CreateDrug: register failed: {e.Message}"); }
 
-                // Item names resolve via Strings 'evidence.names' keyed by presetName.
-                try { Strings.WriteToDictionary("evidence.names", presetKey, "", displayName, "", 0, false, ""); }
+                // Item names resolve via Strings 'evidence.names' keyed by presetName; the 'notes' slot (3rd arg) carries
+                // the examine description. So the dose reads as the case's drug name + "A mysterious new substance".
+                try { Strings.WriteToDictionary("evidence.names", presetKey, DrugDescription, displayName, "", 0, false, ""); }
                 catch (Exception e) { Log($"CreateDrug: WriteToDictionary failed: {e.Message}"); }
 
                 Current = clone; CurrentKey = presetKey; CurrentDisplay = displayName;
+                try { _drugNames[clone.Pointer] = displayName; } catch { }   // register this clone so the card patches recognise its doses + show this name
                 Log($"CreateDrug: created '{displayName}' (key={presetKey}) from base '{SafeName(BasePreset)}'");
                 return clone;
             }
             catch (Exception e) { Log($"CreateDrug error: {e}"); return null; }
+        }
+
+        // Rename the CURRENT drug preset in place (no new clone) so each operation's doses carry that case's drug name.
+        // Rewrites the evidence.names entry keyed by the preset's key; every existing/new dose of this preset then shows
+        // the new name. Safe because cases are serial and the previous op's doses are cleaned up on resolve.
+        internal static void Rename(string displayName)
+        {
+            try
+            {
+                if (Current == null || string.IsNullOrEmpty(CurrentKey)) { CreateDrug("NarcOpDrug", string.IsNullOrEmpty(displayName) ? "Mystery Drug" : displayName); return; }
+                if (string.IsNullOrEmpty(displayName)) return;
+                try { Strings.WriteToDictionary("evidence.names", CurrentKey, DrugDescription, displayName, "", 0, false, ""); }
+                catch (Exception e) { Log($"Rename: WriteToDictionary failed: {e.Message}"); }
+                CurrentDisplay = displayName;
+                Log($"Rename: current drug is now '{displayName}' (key={CurrentKey}).");
+            }
+            catch (Exception e) { Log($"Rename error: {e.Message}"); }
         }
 
         // Put a dose into a citizen's consumables (what they will later 'use' / sell).

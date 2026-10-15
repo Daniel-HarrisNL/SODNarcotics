@@ -8,7 +8,7 @@ namespace Narcotics
     // on-screen debug panel can show recent activity without alt-tabbing to the console.
     internal static class LogPanel
     {
-        internal static bool Show = true;                 // panel visible (only drawn while EnableDebugKeys is on)
+        internal static bool Show = false;                // panel hidden by default; toggle with the LogPanel key (only drawn while EnableDebugKeys is on)
         private const int Max = 22;
         private static readonly List<string> _lines = new List<string>();
         internal static List<string> Lines => _lines;
