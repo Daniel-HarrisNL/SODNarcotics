@@ -1,6 +1,6 @@
 # Procedural Narcotics Cases
 
-A new drug is on the streets. Catching the dealer will not be enough, you must bring the whole network down. Find the supplier and bring them to justice. 
+A new drug is on the streets. Catching the dealer will not be enough, you must bring the whole network down. Find the supplier and bring them to justice. Inspired by the DEA Agents of Breaking Bad.
 
 ## Requirements
 

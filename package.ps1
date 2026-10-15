@@ -1,4 +1,4 @@
-# Builds the Thunderstore upload zip for Narcotics.
+# Builds the Thunderstore upload zip for Procedural Narcotics Cases.
 # Uses System.IO.Compression with explicit forward-slash entry paths, because Windows
 # PowerShell's Compress-Archive writes backslash entry paths that r2modman mishandles.
 # Run AFTER `dotnet build -c Release`. Produces Narcotics-<version>.zip in the repo root.
