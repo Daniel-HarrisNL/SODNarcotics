@@ -148,7 +148,13 @@ namespace Narcotics
         // varies the photo while our GetSummary/GenerateName patches (base-agnostic, keyed on the dose's preset) still
         // drive the caption + title. Matched as a squashed substring so "Dorma-Dix"/"Birth Control Pills" etc. hit
         // regardless of spacing/case/hyphens.
-        private static readonly string[] DrugBaseTerms = { "betablocker", "paxadol", "dorma", "poison", "insulin", "syringe", "birthcontrol", "sleepingpill", "painkiller" };
+        // RESTRICTED to BetaBlockers only: it is the ONLY base whose clone NewGameLocation.PlaceObject can actually spawn
+        // into the lab stash. ALL the other candidates (paxadol/painkillers, sleeping pills, poison, insulin injector,
+        // birth control pills, syringe) make PlaceObject return null, so the cook's dose never reaches the stash and the
+        // supply chain stalls for those bases (log: "[dose] Place: PlaceObject returned NULL ..."). To re-enable item
+        // variety, the cook->distributor handoff must become data-side (distributor collects from the cook's inventory
+        // instead of a placed world item); until then only BetaBlockers is safe. (The per-case drug NAME still varies.)
+        private static readonly string[] DrugBaseTerms = { "betablocker" };
 
         // Build the per-session pool of drug-item bases: every preset whose squashed name matches a term AND spawns
         // evidence (so it examines as a card). Logged so the matched set is visible after a run. Empty pool -> PickBase
