@@ -750,7 +750,7 @@ namespace Narcotics
                 if (_cookPotter == null || Time.time >= _cookNextPotter)
                 {
                     _cookPotter = LabPotterNode(node) ?? node;
-                    _cookNextPotter = Time.time + 12f + (float)_rng.NextDouble() * 8f;
+                    _cookNextPotter = Time.time + 6f + (float)_rng.NextDouble() * 6f;
                 }
                 _targetNode = _cookPotter;
                 ArmLabDoorClose(CookHuman);                                    // vanilla: cook shuts the lab door on their way out
@@ -1503,12 +1503,29 @@ namespace Narcotics
             {
                 if (Lab == null) return center;
                 var nodes = Lab.nodes; if (nodes == null || nodes.Count == 0) return center;
+                // Nodes our placed lab equipment sits on - the cook must NOT pace onto these or it clips/sticks inside the
+                // machinery. Collect each cluster's anchor + every furniture piece in it.
+                var furnNodes = new HashSet<IntPtr>();
+                try
+                {
+                    for (int i = 0; i < _labFurniture.Count; i++)
+                    {
+                        var fc = _labFurniture[i]; if (fc == null) continue;
+                        try { var an = fc.anchorNode; if (an != null) furnNodes.Add(an.Pointer); } catch { }
+                        try { var cl = fc.clusterList; if (cl != null) for (int j = 0; j < cl.Count; j++) { var fl = cl[j]; if (fl == null) continue; try { var fan = fl.anchorNode; if (fan != null) furnNodes.Add(fan.Pointer); } catch { } } } catch { }
+                    }
+                }
+                catch { }
+                IntPtr curPtr = IntPtr.Zero; try { if (_cookPotter != null) curPtr = _cookPotter.Pointer; } catch { }
                 var cand = new List<NewNode>();
                 for (int i = 0; i < nodes.Count; i++)
                 {
                     var n = nodes[i]; if (n == null) continue;
                     bool bad = false; try { bad = n.isObstacle || n.isInaccessable || n.noAccess || !n.isConnected; } catch { }
                     if (bad) continue;
+                    IntPtr p; try { p = n.Pointer; } catch { continue; }
+                    if (furnNodes.Contains(p)) continue;   // don't stand inside the equipment
+                    if (p == curPtr) continue;             // pick a DIFFERENT node than the current one so the cook actually paces
                     cand.Add(n);
                 }
                 if (cand.Count == 0) return center;

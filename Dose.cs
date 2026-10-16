@@ -62,6 +62,11 @@ namespace Narcotics
                 if (it == null) return null;
 
                 try { it.SetInInventory(holder); } catch (Exception e) { Log($"SetInInventory threw: {e.Message}"); }   // also stamps the holder's fingerprint (the forensic trail); no extra AddNewDynamicFingerprint, which would double the print
+                // CreateWorldInteractable assigns a random citizen as the item's WRITER (same stray-print source as PlaceObject
+                // on the lab doses). Set it to the holder (the creator) so a frisked/lifted dose shows only real handlers'
+                // prints, never a stray unrelated citizen.
+                try { it.writer = holder; } catch { }
+                try { var ev = it.evidence; if (ev != null) ev.SetWriter(holder); } catch { }
                 ClearOwner(it);   // no owner -> taking it (during a search) isn't theft, so bystanders don't attack
                 Track(holder, it);
                 return it;
@@ -76,6 +81,26 @@ namespace Narcotics
         {
             try { if (it != null) it.belongsTo = null; } catch { }
         }
+
+        // Remove every dynamic fingerprint currently on the item. PlaceObject seeds a freshly-spawned clutter item with
+        // its own native handler print(s) - on a vacant lab that shows up as a RANDOM citizen's print beside the cook's,
+        // muddying the lab-raid evidence. We strip them so we can stamp ONLY the real handler. (RemoveDynamicPrint mutates
+        // df, so iterate backwards by index.)
+        private static void StripPrints(Interactable it)
+        {
+            try
+            {
+                if (it == null) return;
+                // 1) dynamic prints (runtime list): remove each, then hard-clear the list as a backstop (RemoveDynamicPrint
+                //    may not drop the entry reliably through interop).
+                try { var df = it.df; if (df != null) { for (int i = df.Count - 1; i >= 0; i--) { try { var d = df[i]; if (d != null) it.RemoveDynamicPrint(d); } catch { } } try { df.Clear(); } catch { } } } catch { }
+                // 2) saved prints (the persisted list the dust renderer also reads) + the fingerprint-count field.
+                try { var sp = it.print; if (sp != null) sp.Clear(); } catch { }
+                try { it.fp = 0; } catch { }
+            }
+            catch (Exception e) { Log($"StripPrints error: {e.Message}"); }
+        }
+
 
         // Place a physical dose into a game location's furniture (a persistent, searchable STASH - e.g. inside the
         // lab). Uses the game's own PlaceObject pipeline (survives streaming + save/load). Not tracked as inventory;
@@ -92,15 +117,26 @@ namespace Narcotics
                 Interactable it = null;
                 try
                 {
-                    it = loc.PlaceObject(preset, owner, null, null, out furn,
+                    // writer = owner (the cook): PlaceObject attributes the item's fingerprints to the WRITER. Passing null
+                    // let the game assign a RANDOM citizen as the handler (and regenerate a fresh one on each placement) -
+                    // that was the mystery unknown print. writer=cook makes the placed dose carry the cook's print as the trail.
+                    it = loc.PlaceObject(preset, owner, owner, null, out furn,
                         passVariable: false, forceSecuritySettings: true, forcedSecurity: 0,
                         forcedOwnership: InteractablePreset.OwnedPlacementRule.both, forcedPriority: 5,
                         placeClosestTo: near, ignoreLimits: true);
                 }
                 catch (Exception pe) { Log($"Place: PlaceObject THREW for base-clone '{pn}': {pe.GetType().Name}: {pe.Message}"); return null; }
                 if (it == null) { Log($"Place: PlaceObject returned NULL for base-clone '{pn}' at loc '{SafeLocName(loc)}' - this drug item did NOT go into the lab stash."); return null; }
-                if (owner != null) { try { it.AddNewDynamicFingerprint(owner, Interactable.PrintLife.timed); } catch { } }
-                ClearOwner(it);   // keep the fingerprint (above) but drop ownership so taking it isn't theft
+                // The random dust print is the item's WRITER (a citizen the game assigns at spawn) - NOT anything in
+                // df/saved/fp (those read clean yet the random still dusts). Set the writer to the cook on both the
+                // interactable and its evidence, so the dust attributes that print to the cook instead of a random.
+                if (owner != null)
+                {
+                    try { it.writer = owner; } catch { }
+                    try { var ev = it.evidence; if (ev != null) ev.SetWriter(owner); } catch (Exception e) { Log($"Place: SetWriter failed: {e.Message}"); }
+                }
+                StripPrints(it);   // clear any spawn-baked df/fp junk; the cook's print now comes solely from the writer set above (one clean cook print, no duplicate)
+                ClearOwner(it);    // drop ownership so taking it during a search isn't theft
                 return it;
             }
             catch (Exception e) { Log($"Place error: {e.Message}"); return null; }

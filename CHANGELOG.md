@@ -1,7 +1,7 @@
 # Changelog
 
 ## 0.2.0
-Added 3 more drug types
+Added 3 more drug types, fixed duplciate fingerprints bug
 
 ## 0.1.4
 Limited drugs to one object type to fix supply-chain stall
