@@ -61,8 +61,7 @@ namespace Narcotics
                 catch (Exception e) { Log($"CreateWorldInteractable threw: {e.Message}"); }
                 if (it == null) return null;
 
-                try { it.SetInInventory(holder); } catch (Exception e) { Log($"SetInInventory threw: {e.Message}"); }
-                try { it.AddNewDynamicFingerprint(holder, Interactable.PrintLife.timed); } catch { }   // guarantee the holder's print (the forensic trail), not only SetInInventory's stamp
+                try { it.SetInInventory(holder); } catch (Exception e) { Log($"SetInInventory threw: {e.Message}"); }   // also stamps the holder's fingerprint (the forensic trail); no extra AddNewDynamicFingerprint, which would double the print
                 ClearOwner(it);   // no owner -> taking it (during a search) isn't theft, so bystanders don't attack
                 Track(holder, it);
                 return it;

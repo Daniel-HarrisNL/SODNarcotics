@@ -161,9 +161,6 @@ namespace Narcotics
             BindApply("Debug Keys", "DumpResolveQuestions", UnityEngine.KeyCode.Backspace,
                 "TESTING: dump every active case's resolve-form questions (and their fields) to the log, so the exact arrest/location wiring of a vanilla murder case can be read. Set to None to disable.",
                 v => NarcoticsConfig.KeyDumpResolve = v);
-            BindApply("Debug Keys", "SpawnTestDose", UnityEngine.KeyCode.None,
-                "TESTING: spawn one drug dose on the ground next to you, cycling to a DIFFERENT base item each press (photo/card variety), with 1-3 random citizens' fingerprints on it (dusting check). No operation needed. Unbound by default; set a key to enable.",
-                v => NarcoticsConfig.KeySpawnTestDose = v);
             BindApply("Debug", "TimeBoostMultiplier", 3.0f,
                 "Fast-forward multiplier applied on top of the game's fastest built-in speed when fast-forward (End) is on. 1 = just simulation speed. The game may clamp values it can't keep up with.",
                 v => NarcoticsConfig.TimeBoostMultiplier = v);
@@ -285,7 +282,6 @@ namespace Narcotics
         public static UnityEngine.KeyCode KeyUnlockComputer = UnityEngine.KeyCode.Insert;   // log into the computer you're using (skip its password), to check surveillance quickly
         public static UnityEngine.KeyCode KeySpawnFurniture = UnityEngine.KeyCode.PageDown;  // TEST: spawn lab furniture in the room you're standing in
         public static UnityEngine.KeyCode KeyDumpResolve = UnityEngine.KeyCode.Backspace;    // TEST: dump active cases' resolve-form question wiring
-        public static UnityEngine.KeyCode KeySpawnTestDose = UnityEngine.KeyCode.None;  // TEST: spawn one dose by the player, cycling base items, with random prints (unbound by default)
         public static float TimeBoostMultiplier = 3.0f;
     }
 

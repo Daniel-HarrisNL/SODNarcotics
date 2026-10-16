@@ -431,61 +431,6 @@ namespace Narcotics
             catch (Exception e) { log.LogWarning($"[Narcotics]  TeleportToNextDrop error: {e.Message}"); }
         }
 
-        // TEST: spawn one drug dose on the ground next to the player, cycling to a DIFFERENT base item each press (so the
-        // photo/card variety can be eyeballed fast), and stamp 1-3 random citizens' fingerprints on it (so dusting can be
-        // checked). Standalone - no operation required; it mints a throwaway drug preset per press.
-        private static int _testDrugCycle;
-        private static readonly System.Random _testRng = new System.Random();
-        internal static void SpawnTestDose()
-        {
-            var log = NarcoticsPlugin.Log;
-            try
-            {
-                var player = Player.Instance;
-                if (player == null) { log.LogWarning("[Narcotics]  SpawnTestDose: no player"); return; }
-                var pool = DrugItem.FindBasePool(false);
-                if (pool == null || pool.Count == 0) { log.LogWarning("[Narcotics]  SpawnTestDose: no drug-item bases found"); return; }
-                var baseP = pool[_testDrugCycle % pool.Count];
-                _testDrugCycle++;
-                string key = "NarcTestDrug_" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
-                string name = null; try { name = NarcNames.PickDrug(); } catch { }
-                if (string.IsNullOrEmpty(name)) name = "Test Drug";
-                var drug = DrugItem.CreateDrug(key, name, baseP);
-                if (drug == null) { log.LogWarning("[Narcotics]  SpawnTestDose: drug create failed"); return; }
-                var it = DrugItem.SpawnDoseAtActor(drug, player, null);
-                if (it == null) { log.LogWarning("[Narcotics]  SpawnTestDose: spawn failed (stand inside a room and retry)"); return; }
-                int prints = AddRandomPrints(it, 1 + _testRng.Next(3));
-                log.LogInfo($"[Narcotics]  SpawnTestDose: '{name}' from base '{SafePresetName(baseP)}' ({_testDrugCycle}/{pool.Count}) with {prints} random print(s) - examine/dust the item at your feet.");
-            }
-            catch (Exception e) { log.LogWarning($"[Narcotics]  SpawnTestDose error: {e.Message}"); }
-        }
-
-        // Stamp up to `count` random citizens' fingerprints on an item (persistent manualRemoval prints, so they stay for
-        // dusting). Returns how many were added.
-        private static int AddRandomPrints(Interactable it, int count)
-        {
-            int added = 0;
-            try
-            {
-                if (it == null) return 0;
-                var cd = CityData.Instance; var dir = cd != null ? cd.citizenDirectory : null;
-                if (dir == null || dir.Count == 0) return 0;
-                for (int i = 0; i < count; i++)
-                {
-                    try
-                    {
-                        var h = dir[_testRng.Next(dir.Count)];
-                        if (h == null) continue;
-                        it.AddNewDynamicFingerprint(h, Interactable.PrintLife.manualRemoval);
-                        added++;
-                        NarcoticsPlugin.Log.LogInfo($"[Narcotics]    test print: {NarcoticsPlugin.Name(h)}");
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-            return added;
-        }
 
         // Dress the active lab with furniture (stand in the lab first for reliable placement).
         internal static void DressLabNow()
@@ -620,7 +565,6 @@ namespace Narcotics
                 if (Input.GetKeyDown(NarcoticsConfig.KeyUnlockComputer)) Diagnostics.UnlockActiveComputer();
                 if (Input.GetKeyDown(NarcoticsConfig.KeySpawnFurniture)) Diagnostics.TestSpawnFurnitureHere();
                 if (Input.GetKeyDown(NarcoticsConfig.KeyDumpResolve)) Diagnostics.DumpResolveQuestions();
-                if (Input.GetKeyDown(NarcoticsConfig.KeySpawnTestDose)) Diagnostics.SpawnTestDose();
             }
             catch (Exception e) { NarcoticsPlugin.Log.LogWarning($"[Narcotics] hotkey update error: {e.Message}"); }
         }
