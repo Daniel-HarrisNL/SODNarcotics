@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 
 namespace Narcotics
@@ -17,6 +18,67 @@ namespace Narcotics
         private static readonly Dictionary<int, List<Interactable>> _held = new Dictionary<int, List<Interactable>>();
 
         internal static void ResetOnLoad() { _held.Clear(); }
+        // Reconnect to dose Interactables that the GAME has already deserialized. The mod's
+        // _held dictionary is purely a managed index, so ResetOnLoad() drops it even while
+        // physical items survive in the game's world/inventories. Reindex after the active
+        // preset/operation is restored and game save loading has completed, before Tick().
+        //
+        // This method MUST NOT Create(), SetInInventory(), change fingerprints, or restore
+        // missing items by count: the player may have seized/destroyed them before saving.
+        // Scoping to the exact active drug key also excludes historical case evidence.
+        internal static int ReindexSavedInventory(string activeDrugKey)
+        {
+            _held.Clear();
+            if (string.IsNullOrEmpty(activeDrugKey)) return 0;
+            try
+            {
+                var cd = CityData.Instance;
+                var savedItems = cd != null ? cd.savableInteractableDictionary : null;
+                if (savedItems == null)
+                {
+                    Log("[resume] savable interactable dictionary not ready; no inventory handles rebound.");
+                    return 0;
+                }
+                var seenIds = new HashSet<int>();
+                var holderIds = new Dictionary<int, List<int>>();
+                int matchedDrugItems = 0, rebound = 0;
+                foreach (var entry in savedItems)
+                {
+                    Interactable item = null;
+                    try { item = entry.Value; } catch { }
+                    if (!Alive(item)) continue;
+                    string key = null;
+                    try { var p = item.preset; if (p != null) key = p.presetName; } catch { }
+                    if (!string.Equals(key, activeDrugKey, StringComparison.Ordinal)) continue;
+                    matchedDrugItems++;
+                    Human holder = null;
+                    try { holder = item.inInventory; } catch { }
+                    if (holder == null) continue; // world/stash/previously seized item, not NPC possession
+                    int itemId;
+                    try { itemId = item.id; } catch { continue; }
+                    if (!seenIds.Add(itemId)) continue;
+                    Track(holder, item);
+                    if (!holderIds.TryGetValue(holder.humanID, out var ids))
+                    {
+                        ids = new List<int>();
+                        holderIds[holder.humanID] = ids;
+                    }
+                    ids.Add(itemId);
+                    rebound++;
+                }
+                Log($"[resume] found {matchedDrugItems} saved world item(s) for {activeDrugKey}; " +
+                    $"rebound {rebound} inventory dose(s) across {_held.Count} holder(s). " +
+                    string.Join("; ", holderIds.Select(kv => $"holder={kv.Key}:ids=[{string.Join(",", kv.Value)}]")) +
+                    ". No items created or moved.");
+                return rebound;
+            }
+            catch (Exception e)
+            {
+                Log($"[resume] inventory reindex failed: {e}");
+                _held.Clear();
+                return 0;
+            }
+        }
 
         // How many physical doses `who` is currently holding (validated + self-healing).
         internal static int CountIn(Human who)

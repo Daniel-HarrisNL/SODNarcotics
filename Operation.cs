@@ -499,11 +499,20 @@ namespace Narcotics
                 _odBuyerId = -1; _odQueue.Clear(); _odNextEligible = Herd.NowHours();
                 _labDressed = true;        // avoid creating duplicate lab equipment
                 _labDosesPlaced = true;    // avoid adding duplicate evidence doses
+                // Rebuild only our managed index of existing active-drug items held by humans.
+                // The game world is authoritative; never recreate doses to match a saved count.
+                int reboundInventory = Dose.ReindexSavedInventory(saved.DrugKey);
+                foreach (var dealer in Dealers)
+                {
+                    if (dealer != null && dealer.Container != null)
+                        dealer.BinDoses = Dose.CountInBin(dealer.Container);
+                }
                 _lastOpEndGT = 0f;
                 Active = true;
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
-                    "Idle jobs reset; inventory/arrest reconstruction still pending.");
+                    $"rebound {reboundInventory} held dose(s); bins resynced from saved pages. " +
+                    "Transient jobs reset; timed process and arrest reconstruction still pending.");
                 return true;
             }
             catch (Exception e) { Log($"RestoreIdentity failed: {e}"); return false; }
