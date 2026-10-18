@@ -316,7 +316,7 @@ namespace Narcotics
             catch (Exception e) { Log($"TickPendingStrip error: {e.Message}"); }
         }
 
-        internal static void Stop()
+        internal static void Stop(bool preserveSolvedCaseEvidence = false)
         {
             try
             {
@@ -331,9 +331,14 @@ namespace Narcotics
                 _lastOpEndGT = Herd.NowHours();     // the next proactive auto-start waits ~CookIntervalHours after this
                 if (_mover != null) Herd.Release(_mover);
                 Herd.ReleaseAll();
-                Dose.DestroyAll();
-                DestroyWorldDoses();
-                Log($"STOPPED (cook {NarcoticsPlugin.Name(CookHuman)} + crew released, doses cleared).");
+                // The solved case keeps its evidence cards. Their image lookup depends on the source interactables, so
+                // leave those objects in the save while still clearing all operation state in ClearState().
+                if (!preserveSolvedCaseEvidence)
+                {
+                    Dose.DestroyAll();
+                    DestroyWorldDoses();
+                }
+                Log($"STOPPED (cook {NarcoticsPlugin.Name(CookHuman)} + crew released, doses {(preserveSolvedCaseEvidence ? "retained for solved-case evidence" : "cleared")}).");
             }
             catch (Exception e) { Log($"Stop error: {e.Message}"); }
             finally { ClearState(); }
@@ -1641,7 +1646,7 @@ namespace Narcotics
                 Human cookToJail = CookHuman;   // capture before Stop() nulls it
                 try { Arrest.Stop(); } catch { }
                 NarcCase.MarkClosed();
-                Stop();   // reverts the lab furniture + releases the crew; sets _lastOpEndGT so InCaseGap holds the next case to the 12h grid
+                Stop(preserveSolvedCaseEvidence: true);   // stop the operation but retain evidence image sources for the solved case
                 // Remove the cook from the world (jailed), like an arrested murderer disappears once the case is solved.
                 try { if (cookToJail != null) { cookToJail.RemoveFromWorld(true); Log($"cook {NarcoticsPlugin.Name(cookToJail)} removed from the world (jailed) on resolution."); } }
                 catch (Exception e) { Log($"cook removal failed: {e.Message}"); }
