@@ -31,6 +31,8 @@ namespace Narcotics
         public float StartedAtGameHours { get; set; }
         public List<int> DistributorIds { get; set; } = new List<int>();
         public List<SavedDealerSite> Dealers { get; set; } = new List<SavedDealerSite>();
+        // Optional per-save cook snapshots. Missing/null is valid for legacy records.
+        public List<SavedCookSession> CookSessions { get; set; } = new List<SavedCookSession>();
     }
 
     internal static class InvestigationPersistence
@@ -42,13 +44,25 @@ namespace Narcotics
         private static bool _loading;
         private static float _nextRetry;
         private static string _lastWarning;
+        private static string _loadSaveIdentity;
+        private static long _loadSaveLastWriteUtcTicks;
+        private static float _loadedGameHours = float.NaN;
 
-        internal static void BeginLoad()
+        internal static void BeginLoad(string saveIdentity, float loadedGameHours)
         {
             _loading = true;
             _restoredThisLoad = false;
             _nextRetry = 0f;
             _lastWarning = null;
+            _loadSaveIdentity = saveIdentity;
+            _loadedGameHours = loadedGameHours;
+            _loadSaveLastWriteUtcTicks = 0;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(_loadSaveIdentity) && File.Exists(_loadSaveIdentity))
+                    _loadSaveLastWriteUtcTicks = File.GetLastWriteTimeUtc(_loadSaveIdentity).Ticks;
+            }
+            catch { }
         }
 
         internal static void AfterGameStarted()
@@ -93,17 +107,87 @@ namespace Narcotics
                     return;
                 }
                 ReadOnce();
+                if (Saved.TryGetValue(record.DrugKey, out var previous) && previous != null && previous.CookSessions != null)
+                    record.CookSessions = previous.CookSessions;
                 Saved[record.DrugKey] = record;
-                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(PathOnDisk));
-                var json = JsonSerializer.Serialize(new List<SavedInvestigation>(Saved.Values),
-                    new JsonSerializerOptions { WriteIndented = true });
-                string temporary = PathOnDisk + ".tmp";
-                File.WriteAllText(temporary, json);
-                File.Move(temporary, PathOnDisk, true);
+                WriteSavedRecords();
                 Log($"recorded case '{record.CaseTitle}' (key={record.DrugKey}, crew={record.DistributorIds.Count}+{record.Dealers.Count}).");
             }
             catch (Exception e) { Warn("recording investigation identity failed: " + e); }
         }
+
+        private static void WriteSavedRecords()
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(PathOnDisk));
+            var json = JsonSerializer.Serialize(new List<SavedInvestigation>(Saved.Values),
+                new JsonSerializerOptions { WriteIndented = true });
+            string temporary = PathOnDisk + ".tmp";
+            File.WriteAllText(temporary, json);
+            File.Move(temporary, PathOnDisk, true);
+        }
+
+        internal static void CommitCookSession(SavedCookSession snapshot)
+        {
+            if (snapshot == null) return;
+            ReadOnce();
+            if (!Saved.TryGetValue(snapshot.DrugKey ?? string.Empty, out var record) || record == null ||
+                record.CaseTitle != snapshot.CaseTitle || record.CookId != snapshot.CookHumanId ||
+                record.LabDirectoryIndex != snapshot.LabDirectoryIndex)
+            {
+                Warn("[cook-save] skipped snapshot commit: active operation identity no longer matches its investigation record.");
+                return;
+            }
+            if (record.CookSessions == null) record.CookSessions = new List<SavedCookSession>();
+            for (int i = record.CookSessions.Count - 1; i >= 0; i--)
+                if (SamePath(record.CookSessions[i]?.SaveIdentity, snapshot.SaveIdentity)) record.CookSessions.RemoveAt(i);
+            record.CookSessions.Add(snapshot);
+            WriteSavedRecords();
+            float remaining = snapshot.CookActive
+                ? (snapshot.CookSessionStartGameHours >= 0f ? snapshot.CookSessionStartGameHours + snapshot.CookShiftHours - snapshot.CapturedAtGameHours : -1f)
+                : snapshot.NextCookAtGameHours - snapshot.CapturedAtGameHours;
+            Log($"[cook-save] committed active={snapshot.CookActive} started={snapshot.CookSessionStartGameHours:0.###} " +
+                $"batchesLeft={snapshot.CookBatchesLeft} savedGT={snapshot.CapturedAtGameHours:0.###} remaining={remaining:0.###} " +
+                $"save={System.IO.Path.GetFileName(snapshot.SaveIdentity)}.");
+        }
+
+        internal static SavedCookSession FindCookSession(SavedInvestigation saved, out string reason, out SavedCookSession diagnostic)
+        {
+            reason = null;
+            diagnostic = null;
+            ReadOnce();
+            if (saved == null) { reason = "investigation identity missing"; return null; }
+            if (string.IsNullOrWhiteSpace(_loadSaveIdentity)) { reason = "selected save identity unavailable"; return null; }
+            if (saved.CookSessions == null || saved.CookSessions.Count == 0) { reason = "legacy save has no cook snapshot"; return null; }
+            if (_loadSaveLastWriteUtcTicks == 0) { reason = "selected save file timestamp unavailable"; return null; }
+            const float HoursTolerance = 0.05f;
+            for (int i = saved.CookSessions.Count - 1; i >= 0; i--)
+            {
+                var candidate = saved.CookSessions[i];
+                if (candidate == null || !SamePath(candidate.SaveIdentity, _loadSaveIdentity)) continue;
+                diagnostic = candidate;
+                if (candidate.SaveFileLastWriteUtcTicks != _loadSaveLastWriteUtcTicks)
+                { reason = "selected save file timestamp differs from captured save"; continue; }
+                if (candidate.SchemaVersion != 1) { reason = "unsupported cook snapshot version"; return null; }
+                if (candidate.DrugKey != saved.DrugKey || candidate.CaseTitle != saved.CaseTitle ||
+                    candidate.CookHumanId != saved.CookId || candidate.LabDirectoryIndex != saved.LabDirectoryIndex)
+                { reason = "operation identity mismatch"; return null; }
+                if (!Finite(candidate.CapturedAtGameHours) || !Finite(_loadedGameHours) ||
+                    Math.Abs(candidate.CapturedAtGameHours - _loadedGameHours) > HoursTolerance)
+                { reason = $"save game-time mismatch (snapshot={candidate.CapturedAtGameHours:0.###}, loaded={_loadedGameHours:0.###})"; return null; }
+                return candidate;
+            }
+            reason = "no snapshot matches selected save path and file timestamp";
+            return null;
+        }
+
+        private static bool SamePath(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+            try { return string.Equals(System.IO.Path.GetFullPath(a), System.IO.Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+            catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+        }
+
+        private static bool Finite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
 
         // Recognize OUR case by its five custom resolution questions, not merely CaseType.custom:
         // other mods can use that case type too. We only bind unsolved cases.
@@ -198,6 +282,7 @@ namespace Narcotics
 
         internal static void Tick()
         {
+            CookSessionPersistence.PollCompletedSaves();
             if (_loading || Operation.Active || _restoredThisLoad) return;
             try
             {

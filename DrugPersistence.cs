@@ -113,9 +113,10 @@ namespace Narcotics
     {
         [HarmonyPrefix]
         [HarmonyPriority(Priority.First)]
-        private static void Prefix()
+        private static void Prefix(StateSaveData __0)
         {
-            InvestigationPersistence.BeginLoad();
+            string saveIdentity = CookSessionPersistence.GetSelectedSaveIdentity();
+            InvestigationPersistence.BeginLoad(saveIdentity, __0 != null ? __0.gameTime : float.NaN);
             DrugPersistence.RestorePresets();
         }
     }

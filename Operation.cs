@@ -65,6 +65,9 @@ namespace Narcotics
         private static float _opStartGT;        // game hours when THIS case initialised; re-cook sessions anchor to it (opStart + N*CookIntervalHours)
         private static bool _cookActive;        // a lab session is in progress (cook staying)
         private static int _cookBatchesLeft;    // batches still to make this session
+        private static int _cookBatchLimit;     // ceiling captured when the current session was initialized
+        private static float _cookShiftHours;   // stable per-operation shift duration
+        private static float _cookIntervalHours; // stable per-operation cadence
         private static float _nextSellScan;     // real-time seconds; throttle the passer-by scan
         private static bool _forceSale;         // F4: make a dealer sell now (bypass the interval + scan throttle)
         private static float _nextAutoStartTry; // real-time seconds; throttle the proactive auto-start retry
@@ -134,7 +137,10 @@ namespace Narcotics
                 CookHuman = cook; Lab = lab; Active = true;
                 _labDressed = false; _nextDressTry = 0f; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;   // fresh lab dressing/doses/cook-potter for this op
                 ResetJob();
-                _opStartGT = Herd.NowHours();      // case init: re-cook sessions anchor to this (opStart + 12h, +24h, ...)
+                _opStartGT = Herd.NowHours();      // case init: re-cook sessions anchor to this (opStart + N*interval)
+                _cookIntervalHours = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+                _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
                 _nextCookTime = Herd.NowHours();   // cook heads to the lab right away on the first day
                 LabStash.Clear();
 
@@ -295,7 +301,7 @@ namespace Narcotics
         // case once it is solved), and the quiet after a case is "whatever time is left in the current 12h cycle".
         private static float NextGridPoint(float afterHours)
         {
-            float iv = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+            float iv = Math.Max(0.1f, _cookIntervalHours > 0f ? _cookIntervalHours : NarcoticsConfig.CookIntervalHours);
             float next = _opStartGT + iv;
             for (int guard = 0; next <= afterHours && guard < 100000; guard++) next += iv;
             return next;
@@ -494,7 +500,10 @@ namespace Narcotics
                 ResetJob();
                 _opStartGT = saved.StartedAtGameHours;
                 if (_opStartGT <= 0f || _opStartGT > Herd.NowHours()) _opStartGT = Herd.NowHours();
-                _nextCookTime = NextGridPoint(Herd.NowHours()); // don't repeat the pre-save batch immediately
+                _cookIntervalHours = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+                _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                _nextCookTime = NextGridPoint(Herd.NowHours()); // legacy fallback until a matching per-save snapshot is found
                 _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0;
                 _odBuyerId = -1; _odQueue.Clear(); _odNextEligible = Herd.NowHours();
                 _labDressed = true;        // avoid creating duplicate lab equipment
@@ -509,6 +518,16 @@ namespace Narcotics
                 }
                 _lastOpEndGT = 0f;
                 Active = true;
+                var cookSnapshot = InvestigationPersistence.FindCookSession(saved, out var cookSkipReason, out var rejectedCookSnapshot);
+                if (cookSnapshot == null)
+                {
+                    var rejected = rejectedCookSnapshot;
+                    LogCookResumeSkipped(cookSkipReason ?? "matching snapshot unavailable", rejected != null ? rejected.CapturedAtGameHours : Herd.NowHours(), rejected != null && rejected.CookActive, rejected != null ? rejected.CookSessionStartGameHours : -1f, rejected != null ? rejected.CookBatchesLeft : 0, rejected != null ? rejected.CookShiftHours : 0f, rejected != null ? rejected.NextCookAtGameHours : -1f);
+                }
+                else if (!RestoreCookSession(cookSnapshot, out cookSkipReason))
+                {
+                    LogCookResumeSkipped(cookSkipReason ?? "snapshot validation failed", cookSnapshot.CapturedAtGameHours, cookSnapshot.CookActive, cookSnapshot.CookSessionStartGameHours, cookSnapshot.CookBatchesLeft, cookSnapshot.CookShiftHours, cookSnapshot.NextCookAtGameHours);
+                }
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
                     $"rebound {reboundInventory} held dose(s); bins resynced from saved pages. " +
@@ -552,7 +571,7 @@ namespace Narcotics
             Distributors.Clear(); Dealers.Clear(); Buyers.Clear(); LabStash.Clear();
             _forceSale = false; _nextSellScan = 0f;
             _odBuyerId = -1; _odAtHours = 0f; _odNextEligible = 0f; _odQueue.Clear();
-            _cookActive = false; _cookBatchesLeft = 0; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;
+            _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0; _cookBatchLimit = 0; _nextCookTime = 0f; _cookShiftHours = 0f; _cookIntervalHours = 0f; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;
             _buyerDealer.Clear(); _buyerSpot.Clear(); _nextSightingReinforce = 0f;
             ResetJob();
             try { Herd.ReleaseAll(); } catch { }
@@ -909,6 +928,10 @@ namespace Narcotics
             try
             {
                 if (CookHuman == null || Lab == null) return;
+                // Do not re-pin a cook already in an arrest flow.
+                try { if (Arrest.IsArrestee(CookHuman.humanID)) { Herd.Release(CookHuman); return; } } catch { }
+                // End an expired restored shift before navigation or batch production.
+                if (FinishCookShiftIfExpired(Herd.NowHours())) return;
                 // If the player has ARRESTED the cook (restrained), stop driving them to the lab - they shouldn't keep
                 // trying to cook while cuffed. Release the pin and let the arrest play out.
                 try { var cai = CookHuman.ai; if (cai != null && cai.restrained) { try { Herd.Release(CookHuman); } catch { } return; } } catch { }
@@ -917,8 +940,10 @@ namespace Narcotics
                     if (Herd.NowHours() < _nextCookTime) return;   // between shifts - the cook lives its normal life
                     _cookActive = true;
                     _cookSessionStart = -1f;   // the shift clock starts when the cook ARRIVES at the lab (set below), NOT at dispatch, so the walk over doesn't eat into the stakeout window
-                    _cookBatchesLeft = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);   // CEILING for this shift (not a requirement)
-                    Log($"cook heading to the lab for a {NarcoticsConfig.CookShiftHours:0.#}h shift: up to {_cookBatchesLeft} dose(s) ON DEMAND (made only when the dealer runs dry); the shift clock starts when they arrive.");
+                    _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                    _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                    _cookBatchesLeft = _cookBatchLimit;   // CEILING for this shift (not a requirement)
+                    Log($"cook heading to the lab for a {_cookShiftHours:0.#}h shift: up to {_cookBatchesLeft} dose(s) ON DEMAND (made only when the dealer runs dry); the shift clock starts when they arrive.");
                 }
 
                 // If the cook is reacting to a tail (confront/flee), GET OUT OF THE WAY: release the lab pin so the vanilla
@@ -949,7 +974,7 @@ namespace Narcotics
                 if (_cookSessionStart < 0f)
                 {
                     _cookSessionStart = Herd.NowHours();
-                    Log($"cook arrived at the lab; {NarcoticsConfig.CookShiftHours:0.#}h shift starts now.");
+                    Log($"cook arrived at the lab; {_cookShiftHours:0.#}h shift starts now.");
                 }
 
                 // Place any doses still in hand from the batch just made (spans a few ticks).
@@ -965,33 +990,122 @@ namespace Narcotics
                 // Keyed to the DEALER - not the whole pipeline - so a dose still in transit (with the distributor) can't
                 // stall the restock; that was the day-2 bug (dealer empty but a dose sat in transit, so PipelineDry never
                 // went true and the cook never cooked). Demand-pull pacing is preserved via the lab-stash-empty gate.
+                // Guard immediately before production so an expired shift cannot gain a reload-time batch.
+                if (FinishCookShiftIfExpired(Herd.NowHours())) return;
                 bool makeNext = _cookBatchesLeft > 0 && DealerDry() && LabStashCount() <= 0;
                 if (makeNext)
                 {
                     Dose.CreateMany(CookHuman, Math.Max(1, NarcoticsConfig.CookStashCap));
                     _cookBatchesLeft--;
-                    int total = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                    int total = Math.Max(1, _cookBatchLimit);
                     Log($"cook made dose {total - _cookBatchesLeft}/{total}{(_cookBatchesLeft > 0 ? " - next after the dealer runs out again" : " (last of the day)")}.");
                     return;   // next ticks place the dose
                 }
 
-                // The cook stays at the lab for the WHOLE shift (CookShiftHours), then goes home - REGARDLESS of how many
-                // doses were made (6 is a ceiling, not a requirement). So the lab is a reliable stakeout window instead of
-                // the cook leaving the moment the day's doses are done. The NEXT shift is on the 12h grid anchored to case
-                // init (opStart + 12h, +24h, ...), mirroring the vanilla serial-killer re-strike; the arrested check at the
-                // top stops it once the cook is cuffed.
-                if (_cookSessionStart >= 0f && Herd.NowHours() >= _cookSessionStart + Math.Max(0.1f, NarcoticsConfig.CookShiftHours))
-                {
-                    _cookActive = false;
-                    float nowH = Herd.NowHours();
-                    _nextCookTime = NextGridPoint(nowH);   // next 12h grid boundary from case init (skips any passed while this shift ran)
-                    try { Herd.Release(CookHuman); } catch { }
-                    int madeThis = Math.Max(1, NarcoticsConfig.CookBatchesPerSession) - _cookBatchesLeft;
-                    Log($"cook's shift ended (made {madeThis} dose(s)); going home. Returns to the lab at case-init + {((_nextCookTime - _opStartGT)):0.#}h (in {(_nextCookTime - nowH):0.#}h) unless arrested.");
-                }
-                // else: still on shift - cook stays pinned at the lab (Herd.ToNode holds them), cooking when the dealer runs dry.
+                // A valid shift remains pinned to the lab until its saved deadline.
             }
             catch (Exception e) { Log($"TickCook error: {e.Message}"); }
+        }
+
+        internal static SavedCookSession CaptureCookSession()
+        {
+            try
+            {
+                if (!Active || CookHuman == null || Lab == null || string.IsNullOrEmpty(DrugItem.CurrentKey)) return null;
+                if (!int.TryParse(LabDirIndex(), out int labIndex)) return null;
+                return new SavedCookSession
+                {
+                    DrugKey = DrugItem.CurrentKey,
+                    CaseTitle = CaseTitle,
+                    CookHumanId = CookHuman.humanID,
+                    LabDirectoryIndex = labIndex,
+                    CapturedAtGameHours = Herd.NowHours(),
+                    OperationStartedAtGameHours = _opStartGT,
+                    CookActive = _cookActive,
+                    CookSessionStartGameHours = _cookSessionStart,
+                    CookShiftHours = Math.Max(0.1f, _cookShiftHours > 0f ? _cookShiftHours : NarcoticsConfig.CookShiftHours),
+                    CookBatchesLeft = Math.Max(0, _cookBatchesLeft),
+                    CookBatchLimit = Math.Max(1, _cookBatchLimit > 0 ? _cookBatchLimit : NarcoticsConfig.CookBatchesPerSession),
+                    NextCookAtGameHours = _nextCookTime,
+                    CookIntervalHours = Math.Max(0.1f, _cookIntervalHours > 0f ? _cookIntervalHours : NarcoticsConfig.CookIntervalHours)
+                };
+            }
+            catch (Exception e) { Log($"[cook-save] state capture failed: {e.Message}"); return null; }
+        }
+
+        private static bool RestoreCookSession(SavedCookSession state, out string reason)
+        {
+            reason = null;
+            float now = Herd.NowHours();
+            if (state == null) { reason = "snapshot missing"; return false; }
+            if (!FiniteCookValue(state.CapturedAtGameHours) || !FiniteCookValue(state.OperationStartedAtGameHours) ||
+                !FiniteCookValue(state.CookSessionStartGameHours) || !FiniteCookValue(state.CookShiftHours) ||
+                !FiniteCookValue(state.NextCookAtGameHours) || !FiniteCookValue(state.CookIntervalHours))
+            { reason = "non-finite game-time value"; return false; }
+            if (state.CookHumanId != (CookHuman != null ? CookHuman.humanID : -1) || state.DrugKey != DrugItem.CurrentKey || state.CaseTitle != CaseTitle)
+            { reason = "restored operation identity mismatch"; return false; }
+            if (Math.Abs(state.OperationStartedAtGameHours - _opStartGT) > 0.05f || Math.Abs(now - state.CapturedAtGameHours) > 0.05f)
+            { reason = $"loaded game time or operation start mismatch (now={now:0.###})"; return false; }
+            if (state.CookShiftHours < 0.1f || state.CookShiftHours > 48f || state.CookIntervalHours < 0.1f || state.CookIntervalHours > 168f ||
+                state.CookBatchLimit < 1 || state.CookBatchLimit > 64 || state.CookBatchesLeft < 0 || state.CookBatchesLeft > state.CookBatchLimit ||
+                state.CookSessionStartGameHours < -1f || state.CookSessionStartGameHours > state.CapturedAtGameHours + 0.05f || state.NextCookAtGameHours < 0f)
+            { reason = "cook snapshot values outside safe bounds"; return false; }
+
+            _opStartGT = state.OperationStartedAtGameHours;
+            _cookIntervalHours = state.CookIntervalHours;
+            _cookShiftHours = state.CookShiftHours;
+            _cookBatchLimit = state.CookBatchLimit;
+            _nextCookTime = state.NextCookAtGameHours;
+            _cookActive = state.CookActive;
+            _cookSessionStart = state.CookSessionStartGameHours;
+            _cookBatchesLeft = state.CookBatchesLeft;
+            // The AI goal is deliberately transient. TickCook rebuilds a safe pin using live nodes and Herd.ToNode.
+            _labNode = null; _cookPotter = null; _cookNextPotter = 0f; _targetNode = null;
+
+            if (_cookActive && _cookSessionStart >= 0f && now >= _cookSessionStart + _cookShiftHours)
+            {
+                FinishCookShiftIfExpired(now);
+                LogCookResumeState(state, now, "saved shift expired; ended once and advanced to the next cadence point");
+                return true;
+            }
+
+            float remaining = _cookActive && _cookSessionStart >= 0f
+                ? Math.Max(0f, _cookSessionStart + _cookShiftHours - now)
+                : (_cookActive ? -1f : _nextCookTime - now);
+            string resumeReason = _cookActive ? (_cookSessionStart < 0f ? "continue travel; shift clock starts on arrival" : "resume original shift")
+                : "between shifts; preserve scheduled start";
+            LogCookResumeState(state, now, resumeReason, remaining);
+            return true;
+        }
+
+        private static bool FinishCookShiftIfExpired(float nowHours)
+        {
+            if (!_cookActive || _cookSessionStart < 0f || nowHours < _cookSessionStart + Math.Max(0.1f, _cookShiftHours)) return false;
+            int madeThis = Math.Max(0, _cookBatchLimit - _cookBatchesLeft);
+            _cookActive = false;
+            _cookBatchesLeft = 0;
+            _cookSessionStart = -1f;
+            _nextCookTime = NextGridPoint(nowHours);
+            try { if (CookHuman != null) Herd.Release(CookHuman); } catch { }
+            Log($"cook shift ended once (made {madeThis} dose(s)); next legitimate shift at {_nextCookTime:0.###} GT.");
+            return true;
+        }
+
+        private static bool FiniteCookValue(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+        private static void LogCookResumeSkipped(string reason, float savedAt, bool active = false, float started = -1f, int batchesLeft = 0, float shiftHours = 0f, float nextCookAt = -1f)
+        {
+            float remaining = active && started >= 0f && shiftHours > 0f ? started + shiftHours - Herd.NowHours() : (!active && nextCookAt >= 0f ? nextCookAt - Herd.NowHours() : -1f);
+            Log($"[cook-resume] skipped active={active} started={started:0.###} batchesLeft={batchesLeft} savedGT={savedAt:0.###} remaining={remaining:0.###} reason={reason}.");
+        }
+
+        private static void LogCookResumeState(SavedCookSession state, float now, string reason, float? remaining = null)
+        {
+            float remainingHours = remaining ?? (state.CookActive && state.CookSessionStartGameHours >= 0f
+                ? Math.Max(0f, state.CookSessionStartGameHours + state.CookShiftHours - now)
+                : (state.CookActive ? -1f : state.NextCookAtGameHours - now));
+            Log($"[cook-resume] active={state.CookActive} started={state.CookSessionStartGameHours:0.###} batchesLeft={state.CookBatchesLeft} " +
+                $"savedGT={state.CapturedAtGameHours:0.###} remaining={remainingHours:0.###} reason={reason}.");
         }
 
         // True when NO dose exists anywhere in the pipeline: not in the cook's hand, not in the lab stash, not carried by
