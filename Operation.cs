@@ -112,6 +112,11 @@ namespace Narcotics
             try
             {
                 if (Active) { Log("an operation is already active; stop it first."); return false; }
+                if (InvestigationPersistence.Loading || InvestigationPersistence.HasUnresolvedCase())
+                {
+                    Log("saved narcotics investigation exists or is loading; refusing to replace its operation.");
+                    return false;
+                }
                 Human cook = PickCook();
                 if (cook == null) { Log("could not find a suitable cook."); return false; }
                 NewAddress lab = LabSiting.PickLab(cook, out _);
@@ -334,6 +339,171 @@ namespace Narcotics
             finally { ClearState(); }
         }
 
+        // Snapshot immutable identities, NOT engine objects or Il2Cpp pointers. Live stock/delivery
+        // state is owned by the loaded game and deliberately not recreated by spawning new items.
+        internal static SavedInvestigation CaptureIdentity()
+        {
+            try
+            {
+                if (!Active || CookHuman == null || Lab == null || string.IsNullOrEmpty(DrugItem.CurrentKey)) return null;
+                int labIndex;
+                if (!int.TryParse(LabDirIndex(), out labIndex)) return null;
+                var record = new SavedInvestigation
+                {
+                    DrugKey = DrugItem.CurrentKey,
+                    DrugName = DrugName,
+                    CaseTitle = CaseTitle,
+                    BasePresetName = DrugItem.BasePreset != null ? DrugItem.BasePreset.presetName : null,
+                    CookId = CookHuman.humanID,
+                    LabDirectoryIndex = labIndex,
+                    LabName = Lab.name,
+                    StartedAtGameHours = _opStartGT
+                };
+                for (int i = 0; i < Distributors.Count; i++)
+                {
+                    var dist = Distributors[i];
+                    if (dist == null || dist.H == null) return null;
+                    record.DistributorIds.Add(dist.H.humanID);
+                }
+                for (int i = 0; i < Dealers.Count; i++)
+                {
+                    var d = Dealers[i]; if (d == null || d.H == null || d.Container == null) return null;
+                    var node = Containers.ContainerNode(d.Container);
+                    if (node == null) return null;
+                    var position = node.position;
+                    record.Dealers.Add(new SavedDealerSite {
+                        HumanId = d.H.humanID,
+                        DistributorIndex = d.DistIndex,
+                        FurnitureName = d.Container.furniture != null ? d.Container.furniture.name : null,
+                        X = position.x, Y = position.y, Z = position.z
+                    });
+                }
+                if (record.DistributorIds.Count == 0 || record.Dealers.Count == 0 ||
+                    string.IsNullOrEmpty(record.BasePresetName)) return null;
+                return record;
+            }
+            catch (Exception e) { Log($"CaptureIdentity failed: {e.Message}"); return null; }
+        }
+
+        private static Human ResolveSavedHuman(int humanId)
+        {
+            try
+            {
+                var cd = CityData.Instance;
+                var citizens = cd != null ? cd.citizenDirectory : null;
+                if (citizens == null) return null;
+                for (int i = 0; i < citizens.Count; i++)
+                {
+                    var person = citizens[i];
+                    if (person != null && person.humanID == humanId) return person;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // An identity-only recovery step. Resets in-flight jobs rather than replaying a half-completed
+        // deposit, overdose, or sale (those would DUPLICATE items or arrests after loading a save).
+        // IMPORTANT: NPC inventories, active arrests and lab-stash object handles still need a later
+        // save-aware reconstruction pass; this is not full operation-state persistence yet.
+        internal static bool RestoreIdentity(SavedInvestigation saved)
+        {
+            try
+            {
+                if (Active || saved == null || saved.DistributorIds == null || saved.Dealers == null ||
+                    saved.DistributorIds.Count == 0 || saved.Dealers.Count == 0) return false;
+                var city = CityData.Instance;
+                var locations = city != null ? city.gameLocationDirectory : null;
+                if (locations == null || saved.LabDirectoryIndex < 0 ||
+                    saved.LabDirectoryIndex >= locations.Count) return false;
+                var location = locations[saved.LabDirectoryIndex];
+                var lab = location != null ? location.TryCast<NewAddress>() : null;
+                if (lab == null || lab.name != saved.LabName) return false;
+                var cook = ResolveSavedHuman(saved.CookId);
+                if (cook == null) return false;
+
+                var restoredDist = new List<Dist>();
+                for (int i = 0; i < saved.DistributorIds.Count; i++)
+                {
+                    var h = ResolveSavedHuman(saved.DistributorIds[i]);
+                    if (h == null) return false;
+                    restoredDist.Add(new Dist { H = h });
+                }
+
+                // Locate the SAME physical containers, not randomly picked new ones. Saved world
+                // positions + furniture preset names disambiguate nearby dumpsters of the same type.
+                var candidates = Containers.SiteContainersNearLab(lab,
+                    Math.Max(24, saved.Dealers.Count * 12));
+                var restoredDealers = new List<Dealer>();
+                var used = new HashSet<IntPtr>();
+                for (int i = 0; i < saved.Dealers.Count; i++)
+                {
+                    var sd = saved.Dealers[i];
+                    var h = ResolveSavedHuman(sd.HumanId);
+                    if (h == null || sd.DistributorIndex < 0 || sd.DistributorIndex >= restoredDist.Count) return false;
+                    FurnitureLocation bin = null;
+                    NewNode drop = null;
+                    float best = 0.25f; // <= 0.5m error in stable world-node coordinates
+                    for (int k = 0; k < candidates.Count; k++)
+                    {
+                        var c = candidates[k]; if (c == null || used.Contains(c.Pointer)) continue;
+                        var n = Containers.ContainerNode(c); if (n == null) continue;
+                        string furniture = c.furniture != null ? c.furniture.name : null;
+                        if (furniture != sd.FurnitureName) continue;
+                        var p = n.position;
+                        float dx = p.x - sd.X, dy = p.y - sd.Y, dz = p.z - sd.Z;
+                        float dist2 = dx * dx + dy * dy + dz * dz;
+                        if (dist2 < best) { best = dist2; bin = c; drop = n; }
+                    }
+                    if (bin == null || !Dose.CanDeposit(bin))
+                    {
+                        Log($"[resume] cannot uniquely reconnect {NarcoticsPlugin.Name(h)}'s original dead drop; will retry.");
+                        return false;
+                    }
+                    used.Add(bin.Pointer);
+                    var dealer = new Dealer { H = h, DistIndex = sd.DistributorIndex,
+                        Container = bin, Drop = drop, DropLoc = drop.gameLocation,
+                        NextSell = Herd.NowHours() + Math.Max(0.1f, NarcoticsConfig.DealerSellIntervalHours) };
+                    IntPtr camera = IntPtr.Zero; float angle, eye;
+                    CameraFrameScore(drop, IntPtr.Zero, out camera, out angle, out eye);
+                    dealer.DropCam = camera;
+                    restoredDealers.Add(dealer);
+                }
+
+                var presets = Toolbox.Instance != null ? Toolbox.Instance.objectPresetDictionary : null;
+                InteractablePreset basePreset = null;
+                if (presets == null || !presets.TryGetValue(saved.BasePresetName, out basePreset) || basePreset == null)
+                    return false;
+                var activeDrug = DrugItem.CreateDrug(saved.DrugKey, saved.DrugName, basePreset,
+                    makeCurrent: true, persist: false);
+                if (activeDrug == null) return false;
+
+                // All required references validated above: only now commit the new runtime operation.
+                CookHuman = cook;
+                Lab = lab;
+                DrugName = saved.DrugName;
+                CaseTitle = saved.CaseTitle;
+                Distributors.Clear(); Distributors.AddRange(restoredDist);
+                Dealers.Clear(); Dealers.AddRange(restoredDealers);
+                Buyers.Clear(); LabStash.Clear();
+                ResetJob();
+                _opStartGT = saved.StartedAtGameHours;
+                if (_opStartGT <= 0f || _opStartGT > Herd.NowHours()) _opStartGT = Herd.NowHours();
+                _nextCookTime = NextGridPoint(Herd.NowHours()); // don't repeat the pre-save batch immediately
+                _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0;
+                _odBuyerId = -1; _odQueue.Clear(); _odNextEligible = Herd.NowHours();
+                _labDressed = true;        // avoid creating duplicate lab equipment
+                _labDosesPlaced = true;    // avoid adding duplicate evidence doses
+                _lastOpEndGT = 0f;
+                Active = true;
+                Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
+                    $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
+                    "Idle jobs reset; inventory/arrest reconstruction still pending.");
+                return true;
+            }
+            catch (Exception e) { Log($"RestoreIdentity failed: {e}"); return false; }
+        }
+
         internal static void ResetOnLoad() { ClearState(); ResetFilmSpots(); _lastOpEndGT = 0f; _nextAutoStartTry = 0f; EnsureVanillaLoopOnLoad(); }
 
         // On every load/new-game: log the murder-loop state and, if the proc-gen loop is OFF (a prior op suppressed it
@@ -412,6 +582,7 @@ namespace Narcotics
             try
             {
                 if (Active || !NarcoticsConfig.Enable) return;
+                if (InvestigationPersistence.Loading || InvestigationPersistence.HasUnresolvedCase()) return;
                 if (NarcoticsConfig.HijackChance < 0.999f) return;   // share mode -> rely on the hijack, not a proactive start
                 if (Time.time < _nextAutoStartTry) return;
                 _nextAutoStartTry = Time.time + 10f;                 // retry cadence until the city is ready + Start succeeds

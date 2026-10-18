@@ -115,6 +115,7 @@ namespace Narcotics
         [HarmonyPriority(Priority.First)]
         private static void Prefix()
         {
+            InvestigationPersistence.BeginLoad();
             DrugPersistence.RestorePresets();
         }
     }
