@@ -802,6 +802,9 @@ namespace Narcotics
                 DrugItem.ResetOnLoad();
                 Dose.ResetOnLoad();
                 Herd.ReleaseAll();
+                // The prefix restores presets before evidence loading; after ResetOnLoad, rebind their names.
+                // This restores item identity only, not the active cook/dealer/operation state.
+                DrugPersistence.RestorePresets();
                 NarcoticsPlugin.Log.LogInfo("[Narcotics] game started/loaded - operation state reset.");
             }
             catch { }
