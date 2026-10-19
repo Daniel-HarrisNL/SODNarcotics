@@ -27,6 +27,11 @@ namespace Narcotics
         public int CookBatchLimit { get; set; }
         public float NextCookAtGameHours { get; set; }
         public float CookIntervalHours { get; set; }
+        // Optional, backwards-compatible supply tracking; absent on older cook snapshots.
+        // IDs identify objects that the game itself saved, never replacement doses.
+        public bool HasWorldTracking { get; set; }
+        public List<int> BuyerHumanIds { get; set; } = new List<int>();
+        public List<int> LabStashInteractableIds { get; set; } = new List<int>();
     }
 
     internal sealed class PendingCookSave

@@ -524,9 +524,13 @@ namespace Narcotics
                     var rejected = rejectedCookSnapshot;
                     LogCookResumeSkipped(cookSkipReason ?? "matching snapshot unavailable", rejected != null ? rejected.CapturedAtGameHours : Herd.NowHours(), rejected != null && rejected.CookActive, rejected != null ? rejected.CookSessionStartGameHours : -1f, rejected != null ? rejected.CookBatchesLeft : 0, rejected != null ? rejected.CookShiftHours : 0f, rejected != null ? rejected.NextCookAtGameHours : -1f);
                 }
-                else if (!RestoreCookSession(cookSnapshot, out cookSkipReason))
+                else
                 {
-                    LogCookResumeSkipped(cookSkipReason ?? "snapshot validation failed", cookSnapshot.CapturedAtGameHours, cookSnapshot.CookActive, cookSnapshot.CookSessionStartGameHours, cookSnapshot.CookBatchesLeft, cookSnapshot.CookShiftHours, cookSnapshot.NextCookAtGameHours);
+                    if (!RestoreCookSession(cookSnapshot, out cookSkipReason))
+                        LogCookResumeSkipped(cookSkipReason ?? "snapshot validation failed", cookSnapshot.CapturedAtGameHours, cookSnapshot.CookActive, cookSnapshot.CookSessionStartGameHours, cookSnapshot.CookBatchesLeft, cookSnapshot.CookShiftHours, cookSnapshot.NextCookAtGameHours);
+                    // Independently rebind saved-world references from the same validated save.
+                    // This only fills managed lists. No interactable is created, moved or deleted.
+                    RestoreWorldTracking(cookSnapshot);
                 }
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
@@ -1013,7 +1017,7 @@ namespace Narcotics
             {
                 if (!Active || CookHuman == null || Lab == null || string.IsNullOrEmpty(DrugItem.CurrentKey)) return null;
                 if (!int.TryParse(LabDirIndex(), out int labIndex)) return null;
-                return new SavedCookSession
+                var snapshot = new SavedCookSession
                 {
                     DrugKey = DrugItem.CurrentKey,
                     CaseTitle = CaseTitle,
@@ -1029,8 +1033,106 @@ namespace Narcotics
                     NextCookAtGameHours = _nextCookTime,
                     CookIntervalHours = Math.Max(0.1f, _cookIntervalHours > 0f ? _cookIntervalHours : NarcoticsConfig.CookIntervalHours)
                 };
+
+                // Capture only references already tracked in this live operation.
+                // Buyers are sales history; an item may have been seized since their purchase.
+                var buyerIds = new HashSet<int>();
+                for (int i = 0; i < Buyers.Count; i++)
+                {
+                    try
+                    {
+                        var buyer = Buyers[i];
+                        if (buyer != null && buyer.humanID >= 0 && buyerIds.Add(buyer.humanID))
+                            snapshot.BuyerHumanIds.Add(buyer.humanID);
+                    }
+                    catch { }
+                }
+                var supplyIds = new HashSet<int>();
+                for (int i = 0; i < LabStash.Count; i++)
+                {
+                    try
+                    {
+                        var item = LabStash[i];
+                        if (IsWorldLabSupply(item, snapshot.DrugKey) && supplyIds.Add(item.id))
+                            snapshot.LabStashInteractableIds.Add(item.id);
+                    }
+                    catch { }
+                }
+                snapshot.HasWorldTracking = true;
+                Log($"[world-save] captured buyers={snapshot.BuyerHumanIds.Count} labStash={snapshot.LabStashInteractableIds.Count} (IDs only).");
+                return snapshot;
             }
             catch (Exception e) { Log($"[cook-save] state capture failed: {e.Message}"); return null; }
+        }
+
+        // Identifies ONLY an already-saved, still-unheld world item from this operation.
+        // Reject a known different location; allow missing node information when the lab
+        // geometry has not streamed, since the save-matched item ID remains authoritative.
+        private static bool IsWorldLabSupply(Interactable item, string drugKey)
+        {
+            try
+            {
+                if (!Dose.Alive(item) || item.id < 0 || item.inInventory != null) return false;
+                var preset = item.preset;
+                if (preset == null || !string.Equals(preset.presetName, drugKey, StringComparison.Ordinal)) return false;
+                var node = item.node;
+                var loc = node != null ? node.gameLocation : null;
+                if (loc != null && Lab != null && loc.Pointer != Lab.Pointer) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static void RestoreWorldTracking(SavedCookSession snapshot)
+        {
+            if (snapshot == null || !snapshot.HasWorldTracking) return;  // legacy cook snapshots
+            try
+            {
+                var buyerIds = snapshot.BuyerHumanIds;
+                var stashIds = snapshot.LabStashInteractableIds;
+                if (buyerIds == null || stashIds == null || buyerIds.Count > 1024 || stashIds.Count > 128)
+                {
+                    Log("[world-resume] skipped: missing or oversized snapshot lists.");
+                    return;
+                }
+                int restoredBuyers = 0, restoredStash = 0;
+                var seenBuyers = new HashSet<int>();
+                for (int i = 0; i < buyerIds.Count; i++)
+                {
+                    int id = buyerIds[i];
+                    if (id < 0 || !seenBuyers.Add(id)) continue;
+                    var buyer = ResolveSavedHuman(id);
+                    if (buyer == null) continue;
+                    Buyers.Add(buyer);
+                    restoredBuyers++;
+                }
+
+                var wanted = new HashSet<int>(stashIds);
+                if (wanted.Count > 0)
+                {
+                    var city = CityData.Instance;
+                    var items = city != null ? city.savableInteractableDictionary : null;
+                    if (items != null)
+                    {
+                        foreach (var entry in items)
+                        {
+                            if (wanted.Count == 0) break;
+                            Interactable item = null;
+                            try { item = entry.Value; } catch { }
+                            if (!Dose.Alive(item)) continue;
+                            int id;
+                            try { id = item.id; } catch { continue; }
+                            if (!wanted.Contains(id) || !IsWorldLabSupply(item, snapshot.DrugKey)) continue;
+                            LabStash.Add(item);
+                            wanted.Remove(id);
+                            restoredStash++;
+                        }
+                    }
+                }
+                Log($"[world-resume] buyers={restoredBuyers}/{buyerIds.Count} labStash={restoredStash}/{stashIds.Count}; " +
+                    $"missingOrInvalidStash={wanted.Count}; no items created or moved.");
+            }
+            catch (Exception e) { Log($"[world-resume] failed: {e.Message}"); }
         }
 
         private static bool RestoreCookSession(SavedCookSession state, out string reason)
