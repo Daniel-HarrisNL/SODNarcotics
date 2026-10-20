@@ -233,6 +233,13 @@ namespace Narcotics
                 try { clone.consumableAmount = 0f; } catch { }
                 try { clone.destroyWhenAllConsumed = false; } catch { }
                 try { clone.takeWith = false; } catch { }
+                // Do NOT persist our doses in save games. A dose uses this RUNTIME-CLONED preset (key 'NarcDrug_<guid>'),
+                // which is not a real registered asset, so the game's save serializer threw a NullReferenceException in
+                // SaveStateController.CaptureSaveStateAsync whenever a dose existed in the world, and reloads reported the
+                // key as missing modded content. The operation state is not persisted across load anyway (ResetOnLoad wipes
+                // it), so excluding our doses from the save is consistent: the case restarts fresh on load instead of
+                // leaving orphaned, unsaveable items. (Belt-and-suspenders: Dose.Create/Place also set Interactable.save=false.)
+                try { clone.dontSaveWithSaveGames = true; } catch (Exception e) { Log($"CreateDrug: set dontSaveWithSaveGames failed: {e.Message}"); }
 
                 // Declassify any WEAPON base (the Syringe is a MurderWeaponPreset, so it offered "attack/throw" instead of
                 // the normal "place/throw"): null the weapon preset so the dose behaves like a regular object, matching the

@@ -67,6 +67,7 @@ namespace Narcotics
                 // prints, never a stray unrelated citizen.
                 try { it.writer = holder; } catch { }
                 try { var ev = it.evidence; if (ev != null) ev.SetWriter(holder); } catch { }
+                try { it.save = false; } catch { }   // don't persist: our runtime-cloned preset can't round-trip the save serializer (NRE in CaptureSaveStateAsync)
                 ClearOwner(it);   // no owner -> taking it (during a search) isn't theft, so bystanders don't attack
                 Track(holder, it);
                 return it;
@@ -136,6 +137,7 @@ namespace Narcotics
                     try { var ev = it.evidence; if (ev != null) ev.SetWriter(owner); } catch (Exception e) { Log($"Place: SetWriter failed: {e.Message}"); }
                 }
                 StripPrints(it);   // clear any spawn-baked df/fp junk; the cook's print now comes solely from the writer set above (one clean cook print, no duplicate)
+                try { it.save = false; } catch { }   // don't persist: our runtime-cloned preset can't round-trip the save serializer (NRE in CaptureSaveStateAsync)
                 ClearOwner(it);    // drop ownership so taking it during a search isn't theft
                 return it;
             }

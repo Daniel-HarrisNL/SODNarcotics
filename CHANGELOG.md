@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.1
+Fixed a save/reload persistence bug
+
 ## 0.2.0
 Added 2 more drug types, fixed duplicate fingerprints bug
 
