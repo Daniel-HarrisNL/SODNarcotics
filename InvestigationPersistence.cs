@@ -156,7 +156,13 @@ namespace Narcotics
             diagnostic = null;
             ReadOnce();
             if (saved == null) { reason = "investigation identity missing"; return null; }
-            if (string.IsNullOrWhiteSpace(_loadSaveIdentity)) { reason = "selected save identity unavailable"; return null; }
+            // During an in-game (hot) load, MainMenuController.selectedSave may be null even
+            // though the native LoadSaveState(StateSaveData) hook has the correct game time.
+            // Never guess a slot by case title or "most recent": accept only ONE unchanged
+            // save file whose recorded snapshot also matches the loaded game's identity/time.
+            // Cold loads keep the stricter, existing selected-path validation below.
+            if (string.IsNullOrWhiteSpace(_loadSaveIdentity))
+                return FindUniqueHotLoadSnapshot(saved, out reason, out diagnostic);
             if (saved.CookSessions == null || saved.CookSessions.Count == 0) { reason = "legacy save has no cook snapshot"; return null; }
             if (_loadSaveLastWriteUtcTicks == 0) { reason = "selected save file timestamp unavailable"; return null; }
             const float HoursTolerance = 0.05f;
@@ -178,6 +184,58 @@ namespace Narcotics
             }
             reason = "no snapshot matches selected save path and file timestamp";
             return null;
+        }
+
+        // Fail-closed recovery for a game-initiated hot load that doesn't expose selectedSave.
+        // It does NOT repair/recreate items, change a snapshot, or select the newest save.
+        // Each candidate must belong to this exact operation, still exist at its original
+        // full path with its recorded last-write tick, and match the loaded game's time.
+        // If more than one candidate is possible, restore none rather than mix save slots.
+        private static SavedCookSession FindUniqueHotLoadSnapshot(
+            SavedInvestigation saved, out string reason, out SavedCookSession diagnostic)
+        {
+            diagnostic = null;
+            reason = "selected save identity unavailable; no uniquely matching saved snapshot";
+            if (saved.CookSessions == null || saved.CookSessions.Count == 0 || !Finite(_loadedGameHours))
+                return null;
+
+            const float HoursTolerance = 0.05f;
+            SavedCookSession match = null;
+            for (int i = 0; i < saved.CookSessions.Count; i++)
+            {
+                var candidate = saved.CookSessions[i];
+                if (candidate == null || candidate.SchemaVersion != 1 ||
+                    candidate.DrugKey != saved.DrugKey || candidate.CaseTitle != saved.CaseTitle ||
+                    candidate.CookHumanId != saved.CookId || candidate.LabDirectoryIndex != saved.LabDirectoryIndex ||
+                    !Finite(candidate.CapturedAtGameHours) ||
+                    Math.Abs(candidate.CapturedAtGameHours - _loadedGameHours) > HoursTolerance ||
+                    candidate.SaveFileLastWriteUtcTicks <= 0 || string.IsNullOrWhiteSpace(candidate.SaveIdentity))
+                    continue;
+
+                try
+                {
+                    // Only previously recorded absolute paths are eligible. Never resolve a
+                    // relative filename against the working directory during hot loading.
+                    if (!System.IO.Path.IsPathRooted(candidate.SaveIdentity) || !File.Exists(candidate.SaveIdentity) ||
+                        File.GetLastWriteTimeUtc(candidate.SaveIdentity).Ticks != candidate.SaveFileLastWriteUtcTicks)
+                        continue;
+                }
+                catch { continue; }
+
+                if (match != null)
+                {
+                    reason = "selected save identity unavailable; multiple snapshots match game time and file timestamps";
+                    return null;
+                }
+                match = candidate;
+            }
+
+            if (match == null) return null;
+            diagnostic = match;
+            reason = null;
+            Log($"[cook-resume] hot-load selected path unavailable; uniquely matched {System.IO.Path.GetFileName(match.SaveIdentity)} " +
+                $"by operation identity, game time and unchanged save-file timestamp.");
+            return match;
         }
 
         private static bool SamePath(string a, string b)
