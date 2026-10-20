@@ -76,6 +76,9 @@ namespace Narcotics
         private static NewNode _labNode;        // cached stable node inside the lab (see LabNode)
         private static NewNode _cookPotter;     // the lab node the cook is currently pottering to (rotated, so they pace while cooking)
         private static float _cookNextPotter;   // real-time seconds; when to pick a new cook potter node
+        // Trace resumed in-flight navigation without affecting inventories or world objects.
+        private static bool _resumeCookTravelTrace;
+        private static float _resumeCookTravelLogAfter;
         private static bool _labDosesPlaced;    // discoverable doses seeded in the lab yet (so the player finds a stash, not just 1)
         private static readonly List<Interactable> _labDiscoveryDoses = new List<Interactable>();   // extra lab doses for the player to find - NOT part of the pull chain (kept out of LabStash so cadence is unchanged)
         private static readonly List<SavedLabDiscoveryDose> _labDiscoveryOriginalPlaces = new List<SavedLabDiscoveryDose>();
@@ -541,6 +544,8 @@ namespace Narcotics
                     // This only fills managed lists. No interactable is created, moved or deleted.
                     RestoreWorldTracking(cookSnapshot);
                     RestoreLabDiscoveryTracking(cookSnapshot);
+                    RestoreLabStage(cookSnapshot);
+                    RestoreOverdoseTracking(cookSnapshot);
                 }
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
@@ -585,6 +590,7 @@ namespace Narcotics
             Distributors.Clear(); Dealers.Clear(); Buyers.Clear(); LabStash.Clear();
             _forceSale = false; _nextSellScan = 0f;
             _odBuyerId = -1; _odAtHours = 0f; _odNextEligible = 0f; _odQueue.Clear();
+            _resumeCookTravelTrace = false; _resumeCookTravelLogAfter = 0f;
             _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0; _cookBatchLimit = 0; _nextCookTime = 0f; _cookShiftHours = 0f; _cookIntervalHours = 0f; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _labDiscoveryOriginalPlaces.Clear(); _labDiscoveryNeedsExactRestore = false; _labDiscoveryVisualPassPending = false; _cookPotter = null; _cookNextPotter = 0f;
             _buyerDealer.Clear(); _buyerSpot.Clear(); _nextSightingReinforce = 0f;
             ResetJob();
@@ -945,12 +951,12 @@ namespace Narcotics
             {
                 if (CookHuman == null || Lab == null) return;
                 // Do not re-pin a cook already in an arrest flow.
-                try { if (Arrest.IsArrestee(CookHuman.humanID)) { Herd.Release(CookHuman); return; } } catch { }
+                try { if (Arrest.IsArrestee(CookHuman.humanID)) { TraceResumedCookTravel("cook-in-arrest", null); Herd.Release(CookHuman); return; } } catch { }
                 // End an expired restored shift before navigation or batch production.
                 if (FinishCookShiftIfExpired(Herd.NowHours())) return;
                 // If the player has ARRESTED the cook (restrained), stop driving them to the lab - they shouldn't keep
                 // trying to cook while cuffed. Release the pin and let the arrest play out.
-                try { var cai = CookHuman.ai; if (cai != null && cai.restrained) { try { Herd.Release(CookHuman); } catch { } return; } } catch { }
+                try { var cai = CookHuman.ai; if (cai != null && cai.restrained) { TraceResumedCookTravel("cook-restrained", null); try { Herd.Release(CookHuman); } catch { } return; } } catch { }
                 if (!_cookActive)
                 {
                     if (Herd.NowHours() < _nextCookTime) return;   // between shifts - the cook lives its normal life
@@ -966,21 +972,30 @@ namespace Narcotics
                 // reaction plays cleanly, instead of the pin fighting it (that caused the cook to repeat the warning bark
                 // on the spot). It re-pins and walks back to the lab once calm; batch timing is game-hours based, so a
                 // brief interruption is harmless.
-                if (Herd.IsReacting(CookHuman)) { try { Herd.Release(CookHuman); } catch { } return; }
+                if (Herd.IsReacting(CookHuman)) { TraceResumedCookTravel("cook-reacting", null); try { Herd.Release(CookHuman); } catch { } return; }
 
                 var node = LabNode(CookHuman);
-                if (node == null) return;                          // lab not streamed yet
-                // POTTER within the lab instead of standing frozen on one node (which could be inside the furniture):
-                // rotate among nearby lab nodes every ~12-20s and play the hands-busy gesture so the cook paces while
-                // looking like they're working. The cook is "at the lab" whenever they're on any of these nodes.
-                if (_cookPotter == null || Time.time >= _cookNextPotter)
+                if (node == null)
+                {
+                    TraceResumedCookTravel("lab-node-unavailable", null);
+                    return; // never teleport a cook or guess a substitute location
+                }
+                // While the cook is en route, the target must remain STABLE. Rotating
+                // _cookPotter every 6-12 real seconds previously replaced the AI goal
+                // before doors/pathfinding could complete. After first arrival, the
+                // ordinary in-lab pottering cadence resumes.
+                if (_cookPotter == null || (_cookSessionStart >= 0f && Time.time >= _cookNextPotter))
                 {
                     _cookPotter = LabPotterNode(node) ?? node;
                     _cookNextPotter = Time.time + 6f + (float)_rng.NextDouble() * 6f;
                 }
                 _targetNode = _cookPotter;
                 ArmLabDoorClose(CookHuman);                                    // vanilla: cook shuts the lab door on their way out
-                if (!Herd.ToNode(CookHuman, _cookPotter, Lab, 1.2f)) return;   // walk to the current potter node, then do lab work
+                if (!Herd.ToNode(CookHuman, _cookPotter, Lab, 1.2f))
+                {
+                    TraceResumedCookTravel("en-route", _cookPotter);
+                    return;
+                }
                 try { Anim.Locking(CookHuman); } catch { }                     // hands-busy "cooking" gesture
 
                 // First tick the cook actually REACHES the lab this shift, start the CookShiftHours clock HERE (not at
@@ -990,6 +1005,7 @@ namespace Narcotics
                 if (_cookSessionStart < 0f)
                 {
                     _cookSessionStart = Herd.NowHours();
+                    _resumeCookTravelTrace = false;
                     Log($"cook arrived at the lab; {_cookShiftHours:0.#}h shift starts now.");
                 }
 
@@ -1070,6 +1086,25 @@ namespace Narcotics
                     }
                     catch { }
                 }
+                // Preserve the first overdose even if the operation has not opened a case.
+                // Captured before native SaveState serialization begins, so the saved
+                // operation timeline matches the native game save.
+                snapshot.HasLabStageTracking = true;
+                snapshot.LabWasDressed = _labDressed;
+                snapshot.LabDosesWereSeeded = _labDosesPlaced;
+                snapshot.HasCaseOpenState = true;
+                snapshot.CaseWasOpen = NarcCase.IsOpen;
+                snapshot.HasOverdoseTracking = true;
+                snapshot.PendingOverdoseBuyerId = _odBuyerId;
+                snapshot.PendingOverdoseAtGameHours = _odAtHours;
+                snapshot.NextOverdoseEligibleAtGameHours = _odNextEligible;
+                snapshot.QueuedOverdoseBuyerIds.AddRange(_odQueue);
+                if (!snapshot.CaseWasOpen && Arrest.Active && Arrest.Subject != null)
+                {
+                    int arrestId = SafeId(Arrest.Subject);
+                    if (arrestId >= 0 && buyerIds.Contains(arrestId))
+                        snapshot.PreCaseApproachingBuyerId = arrestId;
+                }
                 snapshot.HasWorldTracking = true;
                 snapshot.HasLabDiscoveryTracking = true;
                 snapshot.LabDiscoveryWasSeeded = _labDosesPlaced;
@@ -1099,6 +1134,64 @@ namespace Narcotics
                 return snapshot;
             }
             catch (Exception e) { Log($"[cook-save] state capture failed: {e.Message}"); return null; }
+        }
+
+        // An operation saved before the player ever visited the lab must still
+        // dress that lab and seed the four evidence doses when geometry streams.
+        private static void RestoreLabStage(SavedCookSession saved)
+        {
+            if (saved == null || !saved.HasLabStageTracking) return;
+            if (!saved.LabWasDressed)
+            {
+                _labDressed = false;
+                _nextDressTry = 0f;
+                _labDressTries = 0;
+                _labFurniture.Clear();
+            }
+            if (!saved.LabDosesWereSeeded) _labDosesPlaced = false;
+            Log($"[lab-stage-resume] dressed={_labDressed} evidenceSeeded={_labDosesPlaced}; " +
+                "pre-first-visit saves may finish dressing on lab entry.");
+        }
+
+        // Buyer identity has already been rebound from this precise native save.
+        // Overdoses remain scheduled for their original game-time, never replay sales.
+        private static void RestoreOverdoseTracking(SavedCookSession saved)
+        {
+            if (saved == null || !saved.HasOverdoseTracking) return;
+            try
+            {
+                _odBuyerId = -1;
+                _odAtHours = 0f;
+                _odQueue.Clear();
+                float now = Herd.NowHours();
+                _odNextEligible = !float.IsNaN(saved.NextOverdoseEligibleAtGameHours) &&
+                    !float.IsInfinity(saved.NextOverdoseEligibleAtGameHours)
+                    ? saved.NextOverdoseEligibleAtGameHours : now;
+                var known = new HashSet<int>();
+                foreach (var buyer in Buyers)
+                    if (buyer != null) known.Add(buyer.humanID);
+                int due = saved.PendingOverdoseBuyerId;
+                if (known.Contains(due) && !float.IsNaN(saved.PendingOverdoseAtGameHours) &&
+                    !float.IsInfinity(saved.PendingOverdoseAtGameHours))
+                {
+                    _odBuyerId = due;
+                    _odAtHours = saved.PendingOverdoseAtGameHours;
+                }
+                else if (!saved.CaseWasOpen && known.Contains(saved.PreCaseApproachingBuyerId))
+                {
+                    // A first overdose already happened but its enforcer hadn't cuffed
+                    // the buyer at save time. Retire the dead arrest machine and resume
+                    // the same buyer's incident once; never manufacture a new sale/dose.
+                    _odBuyerId = saved.PreCaseApproachingBuyerId;
+                    _odAtHours = now + 0.01f;
+                }
+                var unique = new HashSet<int>();
+                foreach (int id in saved.QueuedOverdoseBuyerIds ?? new List<int>())
+                    if (id != _odBuyerId && known.Contains(id) && unique.Add(id)) _odQueue.Add(id);
+                Log($"[od-resume] pending={_odBuyerId} at={_odAtHours:0.###} " +
+                    $"queued={_odQueue.Count} eligible={_odNextEligible:0.###} caseAtSave={saved.CaseWasOpen}; no new items or arrests created.");
+            }
+            catch (Exception e) { Log($"[od-resume] failed: {e.Message}"); }
         }
 
         // Identifies ONLY an already-saved, still-unheld world item from this operation.
@@ -1521,6 +1614,8 @@ namespace Narcotics
             _cookBatchesLeft = state.CookBatchesLeft;
             // The AI goal is deliberately transient. TickCook rebuilds a safe pin using live nodes and Herd.ToNode.
             _labNode = null; _cookPotter = null; _cookNextPotter = 0f; _targetNode = null;
+            _resumeCookTravelTrace = _cookActive && _cookSessionStart < 0f;
+            _resumeCookTravelLogAfter = 0f;
 
             if (_cookActive && _cookSessionStart >= 0f && now >= _cookSessionStart + _cookShiftHours)
             {
@@ -1536,6 +1631,28 @@ namespace Narcotics
                 : "between shifts; preserve scheduled start";
             LogCookResumeState(state, now, resumeReason, remaining);
             return true;
+        }
+
+        // Diagnostic-only heartbeat for a saved cook who was travelling when saved.
+        // No item creation, movement, timing changes or AI goal modifications here.
+        private static void TraceResumedCookTravel(string stage, NewNode target)
+        {
+            if (!_resumeCookTravelTrace || Time.time < _resumeCookTravelLogAfter) return;
+            _resumeCookTravelLogAfter = Time.time + 15f;
+            try
+            {
+                var current = CookHuman != null ? CookHuman.currentNode : null;
+                var ai = CookHuman != null ? CookHuman.ai : null;
+                bool hasGoal = false;
+                try { hasGoal = ai != null && ai.currentGoal != null; } catch { }
+                float distance = -1f;
+                try { if (current != null && target != null) distance = Vector3.Distance(current.position, target.position); } catch { }
+                Log($"[cook-resume-travel] stage={stage} cook={NarcoticsPlugin.Name(CookHuman)} " +
+                    $"gameTime={Herd.NowHours():0.###} target={(target != null ? "present" : "missing")} " +
+                    $"currentNode={(current != null ? "present" : "missing")} ai={(ai != null ? "present" : "missing")} " +
+                    $"goal={(hasGoal ? "present" : "missing")} distanceM={distance:0.##}; waiting for ORIGINAL cook to reach ORIGINAL lab.");
+            }
+            catch (Exception e) { Log($"[cook-resume-travel] diagnostics unavailable: {e.Message}"); }
         }
 
         private static bool FinishCookShiftIfExpired(float nowHours)

@@ -41,6 +41,11 @@ namespace Narcotics
         private static readonly Dictionary<string, SavedInvestigation> Saved = new Dictionary<string, SavedInvestigation>();
         private static bool _read;
         private static bool _restoredThisLoad;
+        private static bool _preCasePending;
+        // LoadSaveState and OnStartGame are not guaranteed to precede the first murder
+        // hijack/update in a fixed order. Reserve a validated pre-case operation during
+        // the native load prefix, before any operation can be started.
+        private static bool _nativeSaveLoadPending;
         private static bool _loading;
         private static float _nextRetry;
         private static string _lastWarning;
@@ -51,7 +56,9 @@ namespace Narcotics
         internal static void BeginLoad(string saveIdentity, float loadedGameHours)
         {
             _loading = true;
+            _nativeSaveLoadPending = true;
             _restoredThisLoad = false;
+            _preCasePending = false;
             _nextRetry = 0f;
             _lastWarning = null;
             _loadSaveIdentity = saveIdentity;
@@ -63,6 +70,10 @@ namespace Narcotics
                     _loadSaveLastWriteUtcTicks = File.GetLastWriteTimeUtc(_loadSaveIdentity).Ticks;
             }
             catch { }
+            // IMPORTANT: this happens in LoadSaveState Prefix. The game's murder hijack
+            // may fire before our Update/Tick runs. A pre-case save has no game Case for
+            // HasUnresolvedCase() to find, so the flag MUST already be set here.
+            ReservePreCaseDuringLoad();
         }
 
         internal static void AfterGameStarted()
@@ -70,6 +81,21 @@ namespace Narcotics
             _loading = false;
             _restoredThisLoad = false;
             _nextRetry = 0f;
+            if (_nativeSaveLoadPending)
+            {
+                // Old implementation cleared _preCasePending here, exposing a window
+                // for the murder hijack to replace the saved operation before Tick.
+                ReservePreCaseDuringLoad();
+            }
+            else
+            {
+                // Fresh city, not a native save load: do not carry a reservation over.
+                _preCasePending = false;
+                _loadSaveIdentity = null;
+                _loadedGameHours = float.NaN;
+                _loadSaveLastWriteUtcTicks = 0;
+            }
+            _nativeSaveLoadPending = false;
         }
 
         private static void ReadOnce()
@@ -93,8 +119,8 @@ namespace Narcotics
             catch (Exception e) { Warn("reading investigation identities failed: " + e.Message); }
         }
 
-        // Called only once the CASE has actually opened: saving the initial operation when it starts
-        // could leave a dangling entry for an investigation that was never created or saved.
+        // Once the case opens, update its identity while keeping per-save snapshots
+        // captured during the pre-case phase of this SAME operation.
         internal static void RecordOpenedCase()
         {
             try
@@ -107,7 +133,8 @@ namespace Narcotics
                     return;
                 }
                 ReadOnce();
-                if (Saved.TryGetValue(record.DrugKey, out var previous) && previous != null && previous.CookSessions != null)
+                if (Saved.TryGetValue(record.DrugKey, out var previous) && previous != null &&
+                    SameOperation(previous, record) && previous.CookSessions != null)
                     record.CookSessions = previous.CookSessions;
                 Saved[record.DrugKey] = record;
                 WriteSavedRecords();
@@ -126,16 +153,31 @@ namespace Narcotics
             File.Move(temporary, PathOnDisk, true);
         }
 
-        internal static void CommitCookSession(SavedCookSession snapshot)
+        // This is called only AFTER the native asynchronous game save completed.
+        // The identity was captured alongside the native state, before the save task
+        // finished. A pre-case save is therefore just as safe as a post-case save.
+        internal static void CommitCookSession(SavedCookSession snapshot, SavedInvestigation capturedIdentity)
         {
-            if (snapshot == null) return;
+            if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SaveIdentity) ||
+                snapshot.SaveFileLastWriteUtcTicks <= 0) return;
             ReadOnce();
-            if (!Saved.TryGetValue(snapshot.DrugKey ?? string.Empty, out var record) || record == null ||
-                record.CaseTitle != snapshot.CaseTitle || record.CookId != snapshot.CookHumanId ||
-                record.LabDirectoryIndex != snapshot.LabDirectoryIndex)
+            if (capturedIdentity == null && snapshot.HasCaseOpenState && snapshot.CaseWasOpen)
+                Saved.TryGetValue(snapshot.DrugKey ?? string.Empty, out capturedIdentity);
+            if (capturedIdentity == null || capturedIdentity.DrugKey != snapshot.DrugKey ||
+                capturedIdentity.CaseTitle != snapshot.CaseTitle ||
+                capturedIdentity.CookId != snapshot.CookHumanId ||
+                capturedIdentity.LabDirectoryIndex != snapshot.LabDirectoryIndex)
             {
-                Warn("[cook-save] skipped snapshot commit: active operation identity no longer matches its investigation record.");
+                Warn("[cook-save] skipped: missing or mismatched atomic save identity.");
                 return;
+            }
+            if (!Saved.TryGetValue(snapshot.DrugKey, out var record) || record == null ||
+                !SameOperation(record, capturedIdentity))
+            {
+                // A pre-case operation has no investigation record yet. Do not write
+                // it when Start() fires: only an actual successful game save commits it.
+                record = capturedIdentity;
+                Saved[snapshot.DrugKey] = record;
             }
             if (record.CookSessions == null) record.CookSessions = new List<SavedCookSession>();
             for (int i = record.CookSessions.Count - 1; i >= 0; i--)
@@ -145,9 +187,18 @@ namespace Narcotics
             float remaining = snapshot.CookActive
                 ? (snapshot.CookSessionStartGameHours >= 0f ? snapshot.CookSessionStartGameHours + snapshot.CookShiftHours - snapshot.CapturedAtGameHours : -1f)
                 : snapshot.NextCookAtGameHours - snapshot.CapturedAtGameHours;
-            Log($"[cook-save] committed active={snapshot.CookActive} started={snapshot.CookSessionStartGameHours:0.###} " +
-                $"batchesLeft={snapshot.CookBatchesLeft} savedGT={snapshot.CapturedAtGameHours:0.###} remaining={remaining:0.###} " +
-                $"save={System.IO.Path.GetFileName(snapshot.SaveIdentity)}.");
+            Log($"[cook-save] committed phase={(snapshot.HasCaseOpenState && !snapshot.CaseWasOpen ? "PRE-CASE" : "case-open")} " +
+                $"active={snapshot.CookActive} started={snapshot.CookSessionStartGameHours:0.###} " +
+                $"batchesLeft={snapshot.CookBatchesLeft} savedGT={snapshot.CapturedAtGameHours:0.###} " +
+                $"remaining={remaining:0.###} save={System.IO.Path.GetFileName(snapshot.SaveIdentity)}.");
+        }
+
+        private static bool SameOperation(SavedInvestigation a, SavedInvestigation b)
+        {
+            return a != null && b != null && a.DrugKey == b.DrugKey &&
+                a.CaseTitle == b.CaseTitle && a.CookId == b.CookId &&
+                a.LabDirectoryIndex == b.LabDirectoryIndex && a.LabName == b.LabName &&
+                Math.Abs(a.StartedAtGameHours - b.StartedAtGameHours) <= 0.05f;
         }
 
         internal static SavedCookSession FindCookSession(SavedInvestigation saved, out string reason, out SavedCookSession diagnostic)
@@ -236,6 +287,82 @@ namespace Narcotics
             Log($"[cook-resume] hot-load selected path unavailable; uniquely matched {System.IO.Path.GetFileName(match.SaveIdentity)} " +
                 $"by operation identity, game time and unchanged save-file timestamp.");
             return match;
+        }
+
+        // Without an existing game Case, select ONLY a snapshot explicitly saved
+        // before the first case. FindCookSession enforces exact path+timestamp+time,
+        // or uniquely matched unchanged hot-load files when the path is unavailable.
+        // An ambiguous or overwritten slot is NEVER restored.
+        private static SavedInvestigation FindSavedPreCaseOperation(out SavedCookSession snapshot)
+        {
+            snapshot = null;
+            ReadOnce();
+            SavedInvestigation matched = null;
+            foreach (var record in Saved.Values)
+            {
+                if (record?.CookSessions == null || record.CookSessions.Count == 0) continue;
+                var candidate = FindCookSession(record, out _, out _);
+                if (candidate == null || !candidate.HasCaseOpenState || candidate.CaseWasOpen) continue;
+                if (matched != null) // not enough information to distinguish two cities/slots
+                {
+                    WarnOnce("multiple pre-case operation snapshots match this load; refusing to guess.");
+                    return null;
+                }
+                matched = record;
+                snapshot = candidate;
+            }
+            return matched;
+        }
+
+        // A saved pre-case operation must be protected BEFORE the game's own murder
+        // scheduling can fire, not only once NarcoticsHotkey.Update calls Tick().
+        // Keep the existing exact save path/timestamp/game-time matching. If the
+        // selected slot and game time identify a pre-case snapshot but its timestamp
+        // has changed, do NOT restore that stale snapshot; block replacement and
+        // log why, rather than silently starting a different criminal crew.
+        private static void ReservePreCaseDuringLoad()
+        {
+            if (!Finite(_loadedGameHours))
+            {
+                Log($"[pre-case-load] cannot reserve: loaded game time unavailable; selected={System.IO.Path.GetFileName(_loadSaveIdentity) ?? "(unknown)"}.");
+                return;
+            }
+            var match = FindSavedPreCaseOperation(out var matchedSnapshot);
+            if (match != null)
+            {
+                _preCasePending = true;
+                Log($"[pre-case-load] RESERVED '{match.CaseTitle}' (key={match.DrugKey}), " +
+                    $"save={System.IO.Path.GetFileName(matchedSnapshot.SaveIdentity)}, " +
+                    $"loadedGT={_loadedGameHours:0.###}. Holding murder hijack until restore.");
+                return;
+            }
+
+            // Diagnostic, fail-closed protection for a known slot with changed
+            // timestamp. Never rebind a different slot or use time alone to restore.
+            // When selectedSave is unavailable the existing unique hot-load
+            // validation above remains authoritative.
+            ReadOnce();
+            foreach (var record in Saved.Values)
+            {
+                if (record?.CookSessions == null) continue;
+                foreach (var state in record.CookSessions)
+                {
+                    if (state == null || !state.HasCaseOpenState || state.CaseWasOpen ||
+                        !Finite(state.CapturedAtGameHours) ||
+                        Math.Abs(state.CapturedAtGameHours - _loadedGameHours) > 0.05f ||
+                        !SamePath(state.SaveIdentity, _loadSaveIdentity)) continue;
+                    var checkedState = FindCookSession(record, out var reason, out _);
+                    if (checkedState != null) continue; // exact match handled above
+                    _preCasePending = true;
+                    WarnOnce($"[pre-case-load] BLOCKED replacement for matched pre-case slot " +
+                        $"'{System.IO.Path.GetFileName(state.SaveIdentity)}', gameTime={_loadedGameHours:0.###}: " +
+                        $"{reason ?? "snapshot validation failed"}. Original operation NOT restored; no new one will start.");
+                    return;
+                }
+            }
+            Log($"[pre-case-load] no validated pre-case snapshot for selected=" +
+                $"{System.IO.Path.GetFileName(_loadSaveIdentity) ?? "(unavailable)"}, " +
+                $"loadedGT={_loadedGameHours:0.###}, fileTicks={_loadSaveLastWriteUtcTicks}.");
         }
 
         private static bool SamePath(string a, string b)
@@ -333,7 +460,7 @@ namespace Narcotics
         // This protects player progress rather than quietly replacing Mirage with Drift.
         internal static bool HasUnresolvedCase()
         {
-            return FindSavedCase() != null;
+            return FindSavedCase() != null || _preCasePending;
         }
 
         internal static bool Loading => _loading;
@@ -347,7 +474,22 @@ namespace Narcotics
                 if (UnityEngine.Time.time < _nextRetry) return;
                 _nextRetry = UnityEngine.Time.time + 3f;
                 var c = FindSavedCase();
-                if (c == null) return;
+                if (c == null)
+                {
+                    var preCaseIdentity = FindSavedPreCaseOperation(out var preCaseSnapshot);
+                    if (preCaseIdentity == null) return;
+                    _preCasePending = true; // block bootstrap and murder while retrying
+                    if (!Operation.RestoreIdentity(preCaseIdentity))
+                    {
+                        WarnOnce("valid pre-case save found but crew/lab/bin reconstruction is incomplete; not starting a replacement operation.");
+                        return;
+                    }
+                    _restoredThisLoad = true;
+                    _preCasePending = false;
+                    Log($"RESUMED PRE-CASE '{preCaseIdentity.CaseTitle}' (key={preCaseIdentity.DrugKey}) " +
+                        $"from {System.IO.Path.GetFileName(preCaseSnapshot.SaveIdentity)}; no game case created.");
+                    return;
+                }
                 NarcCase.BindLoadedCase(c);
                 var snapshot = Match(c);
                 if (snapshot == null)

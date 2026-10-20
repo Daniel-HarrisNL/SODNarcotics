@@ -37,6 +37,19 @@ namespace Narcotics
         public bool HasLabDiscoveryTracking { get; set; }
         public bool LabDiscoveryWasSeeded { get; set; }
         public List<SavedLabDiscoveryDose> LabDiscoveryDoses { get; set; } = new List<SavedLabDiscoveryDose>();
+        // Optional version-1 extension. Missing on legacy post-case snapshots.
+        public bool HasLabStageTracking { get; set; }
+        public bool LabWasDressed { get; set; }
+        public bool LabDosesWereSeeded { get; set; }
+        public bool HasCaseOpenState { get; set; }
+        public bool CaseWasOpen { get; set; }
+        public bool HasOverdoseTracking { get; set; }
+        public int PendingOverdoseBuyerId { get; set; } = -1;
+        public float PendingOverdoseAtGameHours { get; set; }
+        public float NextOverdoseEligibleAtGameHours { get; set; }
+        public List<int> QueuedOverdoseBuyerIds { get; set; } = new List<int>();
+        // In-flight first arrest has not opened a case yet; resume the incident.
+        public int PreCaseApproachingBuyerId { get; set; } = -1;
     }
 
     internal sealed class SavedLabDiscoveryDose
@@ -61,6 +74,7 @@ namespace Narcotics
     internal sealed class PendingCookSave
     {
         internal SavedCookSession Snapshot;
+        internal SavedInvestigation Identity;
         internal string SaveIdentity;
         internal Task Task;
     }
@@ -97,9 +111,9 @@ namespace Narcotics
                     LogSaveSkip("active=unknown", Herd.NowHours(), "native save path is empty");
                     return null;
                 }
-                if (!Operation.Active || !NarcCase.IsOpen)
+                if (!Operation.Active)
                 {
-                    LogSaveSkip("active=false", Herd.NowHours(), "no active narcotics case");
+                    LogSaveSkip("active=false", Herd.NowHours(), "no active narcotics operation");
                     return null;
                 }
                 SavedCookSession snapshot = Operation.CaptureCookSession();
@@ -108,6 +122,24 @@ namespace Narcotics
                     LogSaveSkip("active=true", Herd.NowHours(), "operation identity or cook state unavailable");
                     return null;
                 }
+                // Capture the matching crew and site identity BEFORE native save serialization.
+                // The async disk commit must not re-read mutable operation state.
+                var capturedIdentity = Operation.CaptureIdentity();
+                if (capturedIdentity == null && !snapshot.CaseWasOpen)
+                {
+                    LogSaveSkip("active=true", Herd.NowHours(), "pre-case identity could not be captured atomically");
+                    return null;
+                }
+                if (capturedIdentity != null && (capturedIdentity.DrugKey != snapshot.DrugKey ||
+                    capturedIdentity.CaseTitle != snapshot.CaseTitle ||
+                    capturedIdentity.CookId != snapshot.CookHumanId ||
+                    capturedIdentity.LabDirectoryIndex != snapshot.LabDirectoryIndex))
+                {
+                    LogSaveSkip("active=true", Herd.NowHours(), "operation identity changed during save");
+                    return null;
+                }
+                // Existing post-case investigation identity can be reused if a remote
+                // dealer's furniture was unavailable during this particular capture.
                 snapshot.SaveIdentity = identity;
                 float remaining = snapshot.CookActive
                     ? (snapshot.CookSessionStartGameHours >= 0f ? snapshot.CookSessionStartGameHours + snapshot.CookShiftHours - snapshot.CapturedAtGameHours : -1f)
@@ -116,7 +148,7 @@ namespace Narcotics
                     ? "reason=traveling-to-lab" : string.Empty;
                 Log($"[cook-save] captured active={snapshot.CookActive} started={snapshot.CookSessionStartGameHours:0.###} " +
                     $"batchesLeft={snapshot.CookBatchesLeft} savedGT={snapshot.CapturedAtGameHours:0.###} remaining={remaining:0.###} {reason} path={Path.GetFileName(identity)}.");
-                return new PendingCookSave { SaveIdentity = identity, Snapshot = snapshot };
+                return new PendingCookSave { SaveIdentity = identity, Snapshot = snapshot, Identity = capturedIdentity };
             }
             catch (Exception e)
             {
@@ -172,7 +204,7 @@ namespace Narcotics
                         continue;
                     }
                     pending.Snapshot.SaveFileLastWriteUtcTicks = File.GetLastWriteTimeUtc(pending.SaveIdentity).Ticks;
-                    InvestigationPersistence.CommitCookSession(pending.Snapshot);
+                    InvestigationPersistence.CommitCookSession(pending.Snapshot, pending.Identity);
                 }
                 catch (Exception e)
                 {
