@@ -32,6 +32,30 @@ namespace Narcotics
         public bool HasWorldTracking { get; set; }
         public List<int> BuyerHumanIds { get; set; } = new List<int>();
         public List<int> LabStashInteractableIds { get; set; } = new List<int>();
+        // Optional for older snapshots. Keep the original Interactable and its EXACT
+        // furniture/world placement; never respawn a lookalike with a new evidence ID.
+        public bool HasLabDiscoveryTracking { get; set; }
+        public bool LabDiscoveryWasSeeded { get; set; }
+        public List<SavedLabDiscoveryDose> LabDiscoveryDoses { get; set; } = new List<SavedLabDiscoveryDose>();
+    }
+
+    internal sealed class SavedLabDiscoveryDose
+    {
+        public int InteractableId { get; set; }
+        public float X { get; set; }
+        public float Y { get; set; }
+        public float Z { get; set; }
+        public float RotX { get; set; }
+        public float RotY { get; set; }
+        public float RotZ { get; set; }
+        // Unique furniture fingerprint in this game location (as with dead-drop sites).
+        // No furniture signature = no safe attachment repair; never guess a new spot.
+        public string FurnitureName { get; set; }
+        public float FurnitureX { get; set; }
+        public float FurnitureY { get; set; }
+        public float FurnitureZ { get; set; }
+        public int FurnitureListIndex { get; set; } = -1;
+        public bool IntegratedList { get; set; }
     }
 
     internal sealed class PendingCookSave

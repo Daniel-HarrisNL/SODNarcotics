@@ -78,6 +78,11 @@ namespace Narcotics
         private static float _cookNextPotter;   // real-time seconds; when to pick a new cook potter node
         private static bool _labDosesPlaced;    // discoverable doses seeded in the lab yet (so the player finds a stash, not just 1)
         private static readonly List<Interactable> _labDiscoveryDoses = new List<Interactable>();   // extra lab doses for the player to find - NOT part of the pull chain (kept out of LabStash so cadence is unchanged)
+        private static readonly List<SavedLabDiscoveryDose> _labDiscoveryOriginalPlaces = new List<SavedLabDiscoveryDose>();
+        private static bool _labDiscoveryNeedsExactRestore;
+        // The exact-placement pass restores Interactable metadata; after lab streaming,
+        // native Unity visuals sometimes still need to be instantiated from that SAME object.
+        private static bool _labDiscoveryVisualPassPending;
 
         // Overdose cadence: a buyer overdoses a few minutes after a purchase, triggering the enforcer arrest. The
         // FIRST overdose opens the player's case; later ones add a new "search" lead to the SAME case (serial-style,
@@ -135,7 +140,7 @@ namespace Narcotics
                 Log($"operation drug = '{DrugName}'; case title = '{CaseTitle}'.");
 
                 CookHuman = cook; Lab = lab; Active = true;
-                _labDressed = false; _nextDressTry = 0f; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;   // fresh lab dressing/doses/cook-potter for this op
+                _labDressed = false; _nextDressTry = 0f; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _labDiscoveryOriginalPlaces.Clear(); _labDiscoveryNeedsExactRestore = false; _labDiscoveryVisualPassPending = false; _cookPotter = null; _cookNextPotter = 0f;   // fresh lab dressing/doses/cook-potter for this op
                 ResetJob();
                 _opStartGT = Herd.NowHours();      // case init: re-cook sessions anchor to this (opStart + N*interval)
                 _cookIntervalHours = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
@@ -507,7 +512,11 @@ namespace Narcotics
                 _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0;
                 _odBuyerId = -1; _odQueue.Clear(); _odNextEligible = Herd.NowHours();
                 _labDressed = true;        // avoid creating duplicate lab equipment
-                _labDosesPlaced = true;    // avoid adding duplicate evidence doses
+                _labDosesPlaced = true;    // legacy default: never duplicate evidence on an old save
+                _labDiscoveryDoses.Clear();
+                _labDiscoveryOriginalPlaces.Clear();
+                _labDiscoveryNeedsExactRestore = false;
+                _labDiscoveryVisualPassPending = false;
                 // Rebuild only our managed index of existing active-drug items held by humans.
                 // The game world is authoritative; never recreate doses to match a saved count.
                 int reboundInventory = Dose.ReindexSavedInventory(saved.DrugKey);
@@ -531,6 +540,7 @@ namespace Narcotics
                     // Independently rebind saved-world references from the same validated save.
                     // This only fills managed lists. No interactable is created, moved or deleted.
                     RestoreWorldTracking(cookSnapshot);
+                    RestoreLabDiscoveryTracking(cookSnapshot);
                 }
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
@@ -575,7 +585,7 @@ namespace Narcotics
             Distributors.Clear(); Dealers.Clear(); Buyers.Clear(); LabStash.Clear();
             _forceSale = false; _nextSellScan = 0f;
             _odBuyerId = -1; _odAtHours = 0f; _odNextEligible = 0f; _odQueue.Clear();
-            _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0; _cookBatchLimit = 0; _nextCookTime = 0f; _cookShiftHours = 0f; _cookIntervalHours = 0f; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;
+            _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0; _cookBatchLimit = 0; _nextCookTime = 0f; _cookShiftHours = 0f; _cookIntervalHours = 0f; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _labDiscoveryOriginalPlaces.Clear(); _labDiscoveryNeedsExactRestore = false; _labDiscoveryVisualPassPending = false; _cookPotter = null; _cookNextPotter = 0f;
             _buyerDealer.Clear(); _buyerSpot.Clear(); _nextSightingReinforce = 0f;
             ResetJob();
             try { Herd.ReleaseAll(); } catch { }
@@ -650,6 +660,8 @@ namespace Narcotics
             {
                 TickOverdose();                        // fire a scheduled buyer overdose -> arrest -> case
                 TickDressLab();                        // place lab equipment once the lab geometry streams (player visits)
+                RestoreExactLabDiscoveryPlacements();  // reconnect original furniture slots, NEVER choose a new spot
+                RestoreLabDiscoveryVisuals();            // native visual for the SAME saved Interactable, at exact saved transform
                 TickLabDoses();                        // seed a few discoverable doses in the lab (evidence, not supply)
                 TickReinforceSightings();              // keep buyers' dealer sightings fresh so interrogation works
                 if (TickCaseResolution()) return;      // player solved the case -> stand down + wipe this tick
@@ -1059,6 +1071,30 @@ namespace Narcotics
                     catch { }
                 }
                 snapshot.HasWorldTracking = true;
+                snapshot.HasLabDiscoveryTracking = true;
+                snapshot.LabDiscoveryWasSeeded = _labDosesPlaced;
+                var evidenceIds = new HashSet<int>();
+                for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+                {
+                    try
+                    {
+                        var item = _labDiscoveryDoses[i];
+                        if (!Dose.Alive(item) || item.id <= 0 || item.preset == null ||
+                            !string.Equals(item.preset.presetName, snapshot.DrugKey, StringComparison.Ordinal) ||
+                            !evidenceIds.Add(item.id)) continue;
+                        SavedLabDiscoveryDose savedPlace = null;
+                        // On resaving a restored operation, keep its ORIGINAL pre-load placement
+                        // (not a possibly unstreamed or temporarily detached current wrapper).
+                        for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                            if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                            { savedPlace = _labDiscoveryOriginalPlaces[j]; break; }
+                        if (savedPlace == null) savedPlace = CaptureLabDiscoveryPlace(item);
+                        if (savedPlace != null) snapshot.LabDiscoveryDoses.Add(savedPlace);
+                    }
+                    catch (Exception e) { Log($"[lab-evidence-save] item skipped: {e.Message}"); }
+                }
+                Log($"[lab-evidence-save] seeded={snapshot.LabDiscoveryWasSeeded} originalPlaces={snapshot.LabDiscoveryDoses.Count} " +
+                    $"ids=[{string.Join(",", snapshot.LabDiscoveryDoses.ConvertAll(p => p.InteractableId))}]; exact positions and furniture signatures captured.");
                 Log($"[world-save] captured buyers={snapshot.BuyerHumanIds.Count} labStash={snapshot.LabStashInteractableIds.Count} (IDs only).");
                 return snapshot;
             }
@@ -1133,6 +1169,328 @@ namespace Narcotics
                     $"missingOrInvalidStash={wanted.Count}; no items created or moved.");
             }
             catch (Exception e) { Log($"[world-resume] failed: {e.Message}"); }
+        }
+
+        // Game PlaceObject chooses a precise furniture sub-object, not merely a nearby
+        // nav node. Save the item's native world transform AND its parent furniture's
+        // exact identity/slot index, so evidence never migrates to another cabinet.
+        private static SavedLabDiscoveryDose CaptureLabDiscoveryPlace(Interactable item)
+        {
+            try
+            {
+                var pos = item.wPos;
+                var rot = item.wEuler;
+                var record = new SavedLabDiscoveryDose
+                {
+                    InteractableId = item.id,
+                    X = pos.x, Y = pos.y, Z = pos.z,
+                    RotX = rot.x, RotY = rot.y, RotZ = rot.z
+                };
+                var parent = item.furnitureParent;
+                if (parent != null && parent.furniture != null)
+                {
+                    var at = Containers.ContainerNode(parent);
+                    if (at != null)
+                    {
+                        var p = at.position;
+                        record.FurnitureName = parent.furniture.name;
+                        record.FurnitureX = p.x; record.FurnitureY = p.y; record.FurnitureZ = p.z;
+                        var spawned = parent.spawnedInteractables;
+                        if (spawned != null)
+                            for (int i = 0; i < spawned.Count; i++)
+                                if (spawned[i] != null && spawned[i].id == item.id)
+                                { record.FurnitureListIndex = i; break; }
+                        if (record.FurnitureListIndex < 0)
+                        {
+                            var integrated = parent.integratedInteractables;
+                            if (integrated != null)
+                                for (int i = 0; i < integrated.Count; i++)
+                                    if (integrated[i] != null && integrated[i].id == item.id)
+                                    { record.FurnitureListIndex = i; record.IntegratedList = true; break; }
+                        }
+                    }
+                }
+                return record;
+            }
+            catch (Exception e) { Log($"[lab-evidence-save] position capture failed: {e.Message}"); return null; }
+        }
+
+        private static void RestoreLabDiscoveryTracking(SavedCookSession snapshot)
+        {
+            if (snapshot == null || !snapshot.HasLabDiscoveryTracking) return;
+            try
+            {
+                var records = snapshot.LabDiscoveryDoses;
+                if (records == null || records.Count > LabDiscoveryDoses)
+                { Log("[lab-evidence-resume] invalid snapshot; refusing to repair or spawn drugs."); return; }
+                var wanted = new HashSet<int>();
+                for (int i = 0; i < records.Count; i++)
+                {
+                    var r = records[i];
+                    if (r == null || r.InteractableId <= 0 || !wanted.Add(r.InteractableId) ||
+                        float.IsNaN(r.X) || float.IsInfinity(r.X) ||
+                        float.IsNaN(r.Y) || float.IsInfinity(r.Y) ||
+                        float.IsNaN(r.Z) || float.IsInfinity(r.Z))
+                    { Log("[lab-evidence-resume] invalid or duplicate evidence placement; leaving world unchanged."); return; }
+                }
+                _labDiscoveryDoses.Clear();
+                _labDiscoveryOriginalPlaces.Clear();
+                _labDiscoveryOriginalPlaces.AddRange(records);
+                _labDosesPlaced = snapshot.LabDiscoveryWasSeeded;
+                var city = CityData.Instance;
+                var items = city != null ? city.savableInteractableDictionary : null;
+                if (items != null)
+                    foreach (var entry in items)
+                    {
+                        var item = entry.Value;
+                        if (!Dose.Alive(item)) continue;
+                        int id;
+                        try { id = item.id; } catch { continue; }
+                        if (!wanted.Contains(id)) continue;
+                        try
+                        {
+                            if (item.preset == null || !string.Equals(item.preset.presetName, snapshot.DrugKey, StringComparison.Ordinal)) continue;
+                            _labDiscoveryDoses.Add(item);
+                            wanted.Remove(id);
+                        }
+                        catch { }
+                    }
+                _labDiscoveryNeedsExactRestore = _labDiscoveryDoses.Count > 0;
+                _labDiscoveryVisualPassPending = _labDiscoveryNeedsExactRestore;
+                // Try before Unity streams the lab's furniture, not only after entry.
+                // Keep the post-stream pass queued for geometry initially unavailable.
+                if (_labDiscoveryNeedsExactRestore) RestoreExactLabDiscoveryPlacements(early: true);
+                Log($"[lab-evidence-resume] originalPlaces={records.Count} found={_labDiscoveryDoses.Count} missing={wanted.Count}; " +
+                    "will reconnect SAME items to their exact furniture, no replacements.");
+            }
+            catch (Exception e) { Log($"[lab-evidence-resume] failed: {e.Message}"); }
+        }
+
+        // Resolve the SAME furnishing by preset + node position, exactly as dealer
+        // dead drops are reconnected. Unlike the old candidate patch, NEVER choose a
+        // random LabPotterNode, use SetAsNotInventory, or create new Interactables.
+        private static FurnitureLocation FindOriginalLabFurniture(SavedLabDiscoveryDose record)
+        {
+            if (Lab == null || record == null || string.IsNullOrEmpty(record.FurnitureName)) return null;
+            FurnitureLocation found = null;
+            var seen = new HashSet<IntPtr>();
+            var candidates = new List<FurnitureLocation>();
+            var rooms = Lab.rooms;
+            if (rooms != null)
+                for (int i = 0; i < rooms.Count; i++)
+                {
+                    var room = rooms[i];
+                    var locations = room != null ? room.individualFurniture : null;
+                    if (locations != null)
+                        for (int j = 0; j < locations.Count; j++) candidates.Add(locations[j]);
+                }
+            var nodes = Lab.nodes;
+            if (nodes != null)
+                for (int i = 0; i < nodes.Count; i++)
+                {
+                    var node = nodes[i];
+                    var locations = node != null ? node.individualFurniture : null;
+                    if (locations != null)
+                        for (int j = 0; j < locations.Count; j++) candidates.Add(locations[j]);
+                }
+            for (int j = 0; j < candidates.Count; j++)
+            {
+                var f = candidates[j];
+                if (f == null || !seen.Add(f.Pointer) || f.furniture == null ||
+                    f.furniture.name != record.FurnitureName) continue;
+                var node = Containers.ContainerNode(f);
+                if (node == null) continue;
+                var pos = node.position;
+                float dx = pos.x - record.FurnitureX, dy = pos.y - record.FurnitureY, dz = pos.z - record.FurnitureZ;
+                if (dx * dx + dy * dy + dz * dz > 0.0025f) continue; // <=5cm: same original fixture
+                if (found != null && found.Pointer != f.Pointer) return null; // ambiguous, do not guess
+                found = f;
+            }
+            return found;
+        }
+
+        // Runs once *after* the lab has streamed. Only repair the original furniture
+        // reference/list entry and native transform of EXISTING objects. If we cannot
+        // identify the same piece of furniture, log and leave the world unchanged.
+        private static void RestoreExactLabDiscoveryPlacements(bool early = false)
+        {
+            if (!_labDiscoveryNeedsExactRestore || (!early && !PlayerInLab())) return;
+            if (!early) _labDiscoveryNeedsExactRestore = false;
+            int intact = 0, repaired = 0, skipped = 0;
+            for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+            {
+                var item = _labDiscoveryDoses[i];
+                try
+                {
+                    if (!Dose.Alive(item) || item.inInventory != null) { skipped++; continue; }
+                    SavedLabDiscoveryDose r = null;
+                    for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                        if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                        { r = _labDiscoveryOriginalPlaces[j]; break; }
+                    if (r == null) { skipped++; continue; }
+                    var node = item.node;
+                    if (node != null && node.gameLocation != null && node.gameLocation.Pointer != Lab.Pointer)
+                    { skipped++; Log($"[lab-evidence] id={item.id} moved outside lab; unchanged."); continue; }
+                    var original = FindOriginalLabFurniture(r);
+                    if (original == null)
+                    { skipped++; Log($"[lab-evidence] id={item.id} original furniture unresolved; unchanged."); continue; }
+                    // A wrapper can rehydrate with a different pointer to the SAME fixture;
+                    // compare its permanent signature before treating it as moved.
+                    var parent = item.furnitureParent;
+                    if (parent != null && parent.Pointer != original.Pointer)
+                    {
+                        var parentNode = Containers.ContainerNode(parent);
+                        var parentName = parent.furniture != null ? parent.furniture.name : null;
+                        if (parentNode == null || parentName != r.FurnitureName ||
+                            Vector3.Distance(parentNode.position, new Vector3(r.FurnitureX, r.FurnitureY, r.FurnitureZ)) > 0.05f)
+                        { skipped++; Log($"[lab-evidence] id={item.id} now belongs to another fixture; unchanged."); continue; }
+                    }
+                    var list = r.IntegratedList ? original.integratedInteractables : original.spawnedInteractables;
+                    if (list == null)
+                    { skipped++; Log($"[lab-evidence] id={item.id} original furniture list unavailable; unchanged."); continue; }
+                    bool registered = false;
+                    for (int k = 0; k < list.Count; k++)
+                        if (list[k] != null && list[k].id == item.id) { registered = true; break; }
+                    if (parent != null && parent.Pointer == original.Pointer && registered)
+                    { intact++; continue; } // native scene placement is authoritative
+                    if (parent == null || parent.Pointer != original.Pointer) item.furnitureParent = original;
+                    // Reuse exactly the saved object; put it back at its previous list index,
+                    // not a newly chosen slot or node. World transform stays unchanged.
+                    if (!registered)
+                    {
+                        int index = r.FurnitureListIndex;
+                        if (index < 0 || index > list.Count) index = list.Count;
+                        list.Insert(index, item);
+                    }
+                    item.wPos = new Vector3(r.X, r.Y, r.Z);
+                    item.wEuler = new Vector3(r.RotX, r.RotY, r.RotZ);
+                    repaired++;
+                    Log($"[lab-evidence] id={item.id} reattached to ORIGINAL {r.FurnitureName} " +
+                        $"at ({r.X:0.###},{r.Y:0.###},{r.Z:0.###}); original evidence identity intact.");
+                }
+                catch (Exception e) { skipped++; Log($"[lab-evidence] exact attachment error: {e.Message}"); }
+            }
+            Log($"[lab-evidence] exact furniture {(early ? "early" : "in-lab")} check intact={intact} repaired={repaired} skipped={skipped}; " +
+                "no substitute items, relocation, or new supply.");
+        }
+
+        // A reattached Interactable can still lack its Unity GameObject after cold load.
+        // Look for the game's world visual WITHOUT treating evidence registry membership
+        // or FurnitureLocation list membership as proof that a renderer exists.
+        // Reflection keeps this compatible with alternate IL2CPP interop wrapper shapes.
+        private static UnityEngine.Object ExistingLabDiscoveryVisual(Interactable item, out string state)
+        {
+            state = "visual-member-not-found";
+            if (item == null) return null;
+            var flags = System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+            foreach (var memberName in new[] { "controller", "spawnedObject", "spawnedObj", "worldObject" })
+            {
+                try
+                {
+                    object value = null;
+                    var field = typeof(Interactable).GetField(memberName, flags);
+                    if (field != null) value = field.GetValue(item);
+                    else
+                    {
+                        var property = typeof(Interactable).GetProperty(memberName, flags);
+                        if (property == null || property.GetIndexParameters().Length > 0) continue;
+                        value = property.GetValue(item);
+                    }
+                    if (value is UnityEngine.Object unityObject)
+                    {
+                        state = memberName + (unityObject != null ? ":live" : ":missing");
+                        if (unityObject != null) return unityObject;
+                    }
+                    else state = memberName + (value == null ? ":null" : ":non-unity");
+                }
+                catch (Exception e) { state = memberName + ":inspect-failed:" + e.Message; }
+            }
+            return null;
+        }
+
+        // This runs ONCE for the four tracked starter evidence items, after the lab is
+        // streamed and after exact furniture reattachment. SpawnObject is the game's
+        // native visual-instantiation method on the ALREADY-SAVED Interactable; it is
+        // not Toolbox.CreateInteractable or PlaceObject and does not assign a new ID.
+        // The native renderer may be inactive while a closed cabinet hides its contents:
+        // do not SetActive(true), re-home to a convenient node, or create a substitute.
+        private static void RestoreLabDiscoveryVisuals()
+        {
+            if (!_labDiscoveryVisualPassPending || !PlayerInLab()) return;
+            // Never run continuously: retries could create duplicate visual GameObjects.
+            _labDiscoveryVisualPassPending = false;
+            int alreadyLive = 0, spawned = 0, failed = 0, skipped = 0;
+            for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+            {
+                var item = _labDiscoveryDoses[i];
+                try
+                {
+                    if (!Dose.Alive(item) || item.inInventory != null) { skipped++; continue; }
+                    SavedLabDiscoveryDose saved = null;
+                    for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                        if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                        { saved = _labDiscoveryOriginalPlaces[j]; break; }
+                    if (saved == null) { skipped++; continue; }
+                    var original = FindOriginalLabFurniture(saved);
+                    if (original == null || item.furnitureParent == null ||
+                        original.Pointer != item.furnitureParent.Pointer)
+                    { skipped++; Log($"[lab-evidence-visual] id={item.id} exact original furniture not attached; no spawn."); continue; }
+                    var at = item.node;
+                    if (at != null && at.gameLocation != null && at.gameLocation.Pointer != Lab.Pointer)
+                    { skipped++; Log($"[lab-evidence-visual] id={item.id} moved outside lab; no spawn."); continue; }
+                    var visual = ExistingLabDiscoveryVisual(item, out var before);
+                    if (visual != null)
+                    {
+                        alreadyLive++;
+                        Log($"[lab-evidence-visual] id={item.id} existing Unity object ({before}); left unchanged.");
+                        continue;
+                    }
+
+                    int originalId = item.id;
+                    // The authoritative coordinates are the EXACT original placement,
+                    // not the player's location or an arbitrary lab node.
+                    item.wPos = new Vector3(saved.X, saved.Y, saved.Z);
+                    item.wEuler = new Vector3(saved.RotX, saved.RotY, saved.RotZ);
+                    bool nativeFlag = false;
+                    item.SpawnObject(out nativeFlag);
+                    var afterVisual = ExistingLabDiscoveryVisual(item, out var after);
+                    if (item.id != originalId)
+                    {
+                        failed++;
+                        Log($"[lab-evidence-visual] ERROR: original ID changed {originalId}->{item.id} during SpawnObject; investigate.");
+                    }
+                    else if (afterVisual != null)
+                    {
+                        // Native spawning normally reads wPos/wEuler. Force the SAME
+                        // original world transform on the newly materialized visual.
+                        Transform transform = null;
+                        if (afterVisual is Component component) transform = component.transform;
+                        else if (afterVisual is GameObject gameObject) transform = gameObject.transform;
+                        if (transform != null)
+                        {
+                            transform.position = new Vector3(saved.X, saved.Y, saved.Z);
+                            transform.eulerAngles = new Vector3(saved.RotX, saved.RotY, saved.RotZ);
+                        }
+                        spawned++;
+                        Log($"[lab-evidence-visual] id={item.id} native visual spawned; before={before}, after={after}, " +
+                            $"position=({saved.X:0.###},{saved.Y:0.###},{saved.Z:0.###}) ORIGINAL fixture={saved.FurnitureName}.");
+                    }
+                    else
+                    {
+                        failed++;
+                        Log($"[lab-evidence-visual] id={item.id} native SpawnObject returned but no live visual detected; " +
+                            $"before={before}, after={after}, nativeFlag={nativeFlag}. Original item unchanged.");
+                    }
+                }
+                catch (Exception e)
+                {
+                    failed++;
+                    Log($"[lab-evidence-visual] failed to materialize id={(item != null ? item.id : -1)}: {e.Message}");
+                }
+            }
+            Log($"[lab-evidence-visual] in-lab one-shot pass: existing={alreadyLive} spawned={spawned} " +
+                $"failed={failed} skipped={skipped}; same IDs/furniture/original transforms; zero substitute drugs.");
         }
 
         private static bool RestoreCookSession(SavedCookSession state, out string reason)
