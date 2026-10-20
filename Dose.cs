@@ -286,13 +286,18 @@ namespace Narcotics
             return c;
         }
 
-        // Remove up to `max` of our doses from the bin, minting a fresh physical dose in the collector's inventory
-        // for each. Returns how many were collected.
+        // Remove up to `max` of our doses from the searchable bin, creating one physical
+        // dose in the collector's inventory for each. The MetaObject is an EVIDENCE SOURCE:
+        // deleting it via MetaObject.Remove() leaves a previously discovered I{id} case pin
+        // dangling after a save/load, even though the replacement physical dose survives.
+        // Detach only the page entry, retaining the registered MetaObject for that evidence.
+        // The detached entry is no longer searchable, stock-counted or collectible.
         internal static int CollectFromBin(FurnitureLocation fl, Human collector, int max)
         {
             int got = 0;
             try
             {
+                if (collector == null || max <= 0) return 0;
                 var page = FindBinPage(fl); if (page == null) return 0;
                 string key = DrugItem.CurrentKey;
                 var pc = page.pageContent; if (pc == null) return 0;
@@ -301,16 +306,49 @@ namespace Narcotics
                     var e = pc[i]; if (e == null) continue;
                     int id = 0; try { id = e.meta; } catch { }
                     if (!IsOurMeta(id, key)) continue;
-                    try { var m = CityData.Instance.FindMetaObject(id); if (m != null) m.Remove(); } catch { }
-                    try { pc.RemoveAt(i); } catch { }
-                    if (Create(collector) != null) got++;
+
+                    // Mint BEFORE removing the bin's content: an unstreamed collector (or
+                    // failed CreateWorldInteractable) must not consume a saved stash dose.
+                    var created = Create(collector);
+                    if (created == null) { Log($"[evidence] collection deferred: could not create inventory dose for meta={id}."); break; }
+                    if (!HeldBy(created, collector.humanID))
+                    {
+                        RollBackFailedBinCollection(collector, created);
+                        Log($"[evidence] collection deferred: created dose not held by collector, meta={id}.");
+                        break;
+                    }
+                    try { pc.RemoveAt(i); }
+                    catch (Exception e2)
+                    {
+                        RollBackFailedBinCollection(collector, created);
+                        Log($"[evidence] collection deferred: removing page entry meta={id} failed: {e2.Message}");
+                        break;
+                    }
+                    // Do NOT call FindMetaObject(id).Remove() here. The registered meta is
+                    // a historical evidence source, not another physical/stocked dose.
+                    got++;
+                    Log($"[evidence] retired searchable bin entry meta={id}; evidence source retained; physical dose={created.id}.");
                 }
             }
             catch (Exception e) { Log($"CollectFromBin error: {e.Message}"); }
             return got;
         }
 
-        // Remove all our doses from a bin (operation teardown).
+        // Undo only the newly created inventory item if we couldn't detach the source
+        // page entry. No previous dose or discovered evidence should be touched.
+        private static void RollBackFailedBinCollection(Human collector, Interactable created)
+        {
+            try
+            {
+                if (collector != null && _held.TryGetValue(collector.humanID, out var list))
+                    list.Remove(created);
+            }
+            catch { }
+            try { if (created != null) created.SafeDelete(true); } catch { }
+        }
+
+        // Clear searchable stock on operation teardown. Preserve the underlying meta
+        // evidence sources for any pin made before the case was resolved/stopped.
         internal static int ClearBin(FurnitureLocation fl)
         {
             int n = 0;
@@ -324,12 +362,11 @@ namespace Narcotics
                     var e = pc[i]; if (e == null) continue;
                     int id = 0; try { id = e.meta; } catch { }
                     if (!IsOurMeta(id, key)) continue;
-                    try { var m = CityData.Instance.FindMetaObject(id); if (m != null) m.Remove(); } catch { }
-                    try { pc.RemoveAt(i); } catch { }
-                    n++;
+                    try { pc.RemoveAt(i); n++; }
+                    catch (Exception e2) { Log($"[evidence] failed clearing bin entry meta={id}: {e2.Message}"); break; }
                 }
             }
-            catch { }
+            catch (Exception e) { Log($"ClearBin error: {e.Message}"); }
             return n;
         }
 
