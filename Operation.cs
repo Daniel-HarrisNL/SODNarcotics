@@ -20,7 +20,7 @@ namespace Narcotics
     internal static class Operation
     {
         internal sealed class Dist { public Human H; public bool Collected; }
-        internal sealed class Dealer { public Human H; public int DistIndex; public FurnitureLocation Container; public NewNode Drop; public NewGameLocation DropLoc; public IntPtr DropCam; public readonly List<Interactable> Stash = new List<Interactable>(); public int BinDoses; public bool Stocked; public float NextSell; }   // DropCam = the camera Interactable pointer that films the dead drop, so the DEAL can pick a DIFFERENT camera. NextSell = game-hours gate: the dealer potters freely until then, then sells one dose to the nearest passer-by at a filmed node.
+        internal sealed class Dealer { public Human H; public int DistIndex; public FurnitureLocation Container; public NewNode Drop; public NewGameLocation DropLoc; public IntPtr DropCam; public readonly List<Interactable> Stash = new List<Interactable>(); public int BinDoses; public float NextSell; }   // DropCam = the camera Interactable pointer that films the dead drop, so the DEAL can pick a DIFFERENT camera. NextSell = game-hours gate: the dealer potters freely until then, then sells one dose to the nearest passer-by at a filmed node.
 
         internal static bool Active;
         internal static Human CookHuman;
@@ -421,10 +421,8 @@ namespace Narcotics
             return null;
         }
 
-        // An identity-only recovery step. Resets in-flight jobs rather than replaying a half-completed
-        // deposit, overdose, or sale (those would DUPLICATE items or arrests after loading a save).
-        // IMPORTANT: NPC inventories, active arrests and lab-stash object handles still need a later
-        // save-aware reconstruction pass; this is not full operation-state persistence yet.
+        // Rebinds stable operation identities and saved world state without replaying in-flight jobs,
+        // which could duplicate a deposit, overdose, or sale after loading.
         internal static bool RestoreIdentity(SavedInvestigation saved)
         {
             try
@@ -550,7 +548,7 @@ namespace Narcotics
                 Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
                     $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
                     $"rebound {reboundInventory} held dose(s); bins resynced from saved pages. " +
-                    "Transient jobs reset; timed process and arrest reconstruction still pending.");
+                    "Transient jobs reset; saved cook and overdose state restored where available.");
                 return true;
             }
             catch (Exception e) { Log($"RestoreIdentity failed: {e}"); return false; }
@@ -1897,7 +1895,6 @@ namespace Narcotics
                             placed++;
                         }
                         if (_jobDealer.Container != null) _jobDealer.BinDoses = Dose.CountInBin(_jobDealer.Container);   // resync to the LIVE bin (also catches doses the PLAYER took)
-                        _jobDealer.Stocked = true;
                         Log($"DEAD DROP: {NarcoticsPlugin.Name(_jobDist.H)} left x{placed} in {NarcoticsPlugin.Name(_jobDealer.H)}'s {(_jobDealer.Container != null ? "bin" : "spot")} (drop holds {DealerStashCount(_jobDealer)}).");
                         EndJob();
                         break;
