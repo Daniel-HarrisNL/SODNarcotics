@@ -71,6 +71,7 @@ namespace Narcotics
         private static float _nextSellScan;     // real-time seconds; throttle the passer-by scan
         private static bool _forceSale;         // F4: make a dealer sell now (bypass the interval + scan throttle)
         private static float _nextAutoStartTry; // real-time seconds; throttle the proactive auto-start retry
+        private static float _stalledSchedulerLoggedForEndGT = -1f; // one fallback diagnostic per resolved operation
         private static float _lastOpEndGT;      // game hours when the last op ended; the next case waits to the next 12h grid point after it
         private static NewNode _targetNode;     // where the active mover is headed (for the distance readout)
         private static NewNode _labNode;        // cached stable node inside the lab (see LabNode)
@@ -650,8 +651,26 @@ namespace Narcotics
                 {
                     if (InCaseGap()) return;   // still within the game's murder interval since the last case
                     bool loopOn = false; try { var mc = MurderController.Instance; loopOn = mc != null && mc.procGenLoopActive; } catch { }
-                    if (loopOn) return;   // past the gap: the hijack replaces the game's next scheduled murder; no proactive restart
-                    // else loop stuck off -> fall through and proactively restart (safety net so the chain never dies)
+                    if (loopOn)
+                    {
+                        // Normally the next ExecuteNewMurder callback replaces the vanilla case. Some scheduler mods
+                        // can leave the loop enabled but never issue that callback (the observed ConfigurableMurderCooldown
+                        // case). After one expected murder interval plus a short grace, recover only if the game has no
+                        // active murder left. This avoids leaving narcotics-only runs waiting forever while preserving
+                        // a legitimate vanilla case if one is already underway.
+                        float now = Herd.NowHours();
+                        float fallbackAt = Math.Max(NextGridPoint(_lastOpEndGT), _lastOpEndGT + GameMurderIntervalHours() + 6f);
+                        if (now < fallbackAt) return;
+                        int activeMurders = -1;
+                        try { var mc = MurderController.Instance; activeMurders = mc != null && mc.activeMurders != null ? mc.activeMurders.Count : -1; } catch { }
+                        if (activeMurders != 0) return;
+                        if (Math.Abs(_stalledSchedulerLoggedForEndGT - _lastOpEndGT) > 0.01f)
+                        {
+                            _stalledSchedulerLoggedForEndGT = _lastOpEndGT;
+                            Log($"[auto] vanilla murder callback stalled; no active murders {now - _lastOpEndGT:0.0}h after case end (fallback threshold {fallbackAt - _lastOpEndGT:0.0}h). Starting the next narcotics case.");
+                        }
+                    }
+                    // Loop off, or its callback stayed absent past the bounded fallback: start/retry below.
                 }
                 if (Start()) Log("[auto] narcotics auto-started (bootstrap; subsequent cases follow the vanilla murder cadence via the hijack).");
             }
