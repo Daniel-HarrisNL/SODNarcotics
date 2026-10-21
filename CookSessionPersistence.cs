@@ -27,6 +27,11 @@ namespace Narcotics
         public int CookBatchLimit { get; set; }
         public float NextCookAtGameHours { get; set; }
         public float CookIntervalHours { get; set; }
+        // Optional crew timing/state. Missing properties on older JSON snapshots keep legacy fallbacks.
+        public bool HasCrewProgressTracking { get; set; }
+        public List<SavedDistributorProgress> DistributorProgress { get; set; } = new List<SavedDistributorProgress>();
+        public bool HasDealerCooldownTracking { get; set; }
+        public List<SavedDealerCooldown> DealerCooldowns { get; set; } = new List<SavedDealerCooldown>();
         // Optional, backwards-compatible supply tracking; absent on older cook snapshots.
         // IDs identify objects that the game itself saved, never replacement doses.
         public bool HasWorldTracking { get; set; }
@@ -50,6 +55,18 @@ namespace Narcotics
         public List<int> QueuedOverdoseBuyerIds { get; set; } = new List<int>();
         // In-flight first arrest has not opened a case yet; resume the incident.
         public int PreCaseApproachingBuyerId { get; set; } = -1;
+    }
+
+    internal sealed class SavedDistributorProgress
+    {
+        public int HumanId { get; set; }
+        public bool Collected { get; set; }
+    }
+
+    internal sealed class SavedDealerCooldown
+    {
+        public int HumanId { get; set; }
+        public float NextSellAtGameHours { get; set; }
     }
 
     internal sealed class SavedLabDiscoveryDose

@@ -541,6 +541,7 @@ namespace Narcotics
                     // Independently rebind saved-world references from the same validated save.
                     // This only fills managed lists. No interactable is created, moved or deleted.
                     RestoreWorldTracking(cookSnapshot);
+                    RestoreCrewProgress(cookSnapshot);
                     RestoreLabDiscoveryTracking(cookSnapshot);
                     RestoreLabStage(cookSnapshot);
                     RestoreOverdoseTracking(cookSnapshot);
@@ -1103,6 +1104,15 @@ namespace Narcotics
                     if (arrestId >= 0 && buyerIds.Contains(arrestId))
                         snapshot.PreCaseApproachingBuyerId = arrestId;
                 }
+                snapshot.HasCrewProgressTracking = true;
+                foreach (var dist in Distributors)
+                    if (dist != null && dist.H != null && dist.H.humanID >= 0)
+                        snapshot.DistributorProgress.Add(new SavedDistributorProgress { HumanId = dist.H.humanID, Collected = dist.Collected });
+                snapshot.HasDealerCooldownTracking = true;
+                foreach (var dealer in Dealers)
+                    if (dealer != null && dealer.H != null && dealer.H.humanID >= 0 && FiniteCookValue(dealer.NextSell) && dealer.NextSell >= 0f)
+                        snapshot.DealerCooldowns.Add(new SavedDealerCooldown { HumanId = dealer.H.humanID, NextSellAtGameHours = dealer.NextSell });
+                Log($"[crew-save] distributors={snapshot.DistributorProgress.Count} dealerCooldowns={snapshot.DealerCooldowns.Count}.");
                 snapshot.HasWorldTracking = true;
                 snapshot.HasLabDiscoveryTracking = true;
                 snapshot.LabDiscoveryWasSeeded = _labDosesPlaced;
@@ -1132,6 +1142,40 @@ namespace Narcotics
                 return snapshot;
             }
             catch (Exception e) { Log($"[cook-save] state capture failed: {e.Message}"); return null; }
+        }
+
+        // Restore these non-authoritative flags only for the save-matched snapshot.
+        // Physical stock remains authoritative; the timer controls when existing stock may sell.
+        private static void RestoreCrewProgress(SavedCookSession saved)
+        {
+            if (saved == null) return;
+            int distributorsRestored = 0, cooldownsRestored = 0;
+            if (saved.HasCrewProgressTracking && saved.DistributorProgress != null && saved.DistributorProgress.Count <= Distributors.Count)
+            {
+                var seen = new HashSet<int>();
+                foreach (var progress in saved.DistributorProgress)
+                {
+                    if (progress == null || progress.HumanId < 0 || !seen.Add(progress.HumanId)) continue;
+                    var dist = Distributors.Find(d => d != null && d.H != null && d.H.humanID == progress.HumanId);
+                    if (dist == null) continue;
+                    dist.Collected = progress.Collected;
+                    distributorsRestored++;
+                }
+            }
+            if (saved.HasDealerCooldownTracking && saved.DealerCooldowns != null && saved.DealerCooldowns.Count <= Dealers.Count)
+            {
+                var seen = new HashSet<int>();
+                foreach (var cooldown in saved.DealerCooldowns)
+                {
+                    if (cooldown == null || cooldown.HumanId < 0 || !seen.Add(cooldown.HumanId) ||
+                        !FiniteCookValue(cooldown.NextSellAtGameHours) || cooldown.NextSellAtGameHours < 0f) continue;
+                    var dealer = Dealers.Find(d => d != null && d.H != null && d.H.humanID == cooldown.HumanId);
+                    if (dealer == null) continue;
+                    dealer.NextSell = cooldown.NextSellAtGameHours;
+                    cooldownsRestored++;
+                }
+            }
+            Log($"[crew-resume] distributorProgress={distributorsRestored}/{Distributors.Count} dealerCooldowns={cooldownsRestored}/{Dealers.Count}; physical stock unchanged.");
         }
 
         // An operation saved before the player ever visited the lab must still
